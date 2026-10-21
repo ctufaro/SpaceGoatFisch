@@ -1,0 +1,16 @@
+.spacegoat-build/
+.venv/
+build/
+dist/
+__pycache__/
+*.py[cod]
+.verification/
+spacegoat-dev-data/
+spacegoat-validation/
+overlay-update-validation/
+.env
+.env.*
+*.log
+*.sqlite3*
+config.json
+config.*.json
