@@ -5,7 +5,7 @@
 1. Extract the complete `SpaceGoatFisch-Windows-x64.zip` into a folder.
 2. Double-click `Install-SpaceGoat.cmd`. It installs for the current user and creates Desktop and Start Menu shortcuts. No administrator rights or separate Python, OCR engine, or model installation is needed.
 3. Launch the Desktop shortcut. Keep the complete installed folder together, especially `_internal`.
-4. Open the Admin Dashboard URL displayed by the application and unlock it with its Admin credential. Keep the application running; capture and tournament controls are available on the web dashboard.
+4. Open the Admin Dashboard URL displayed by the application. Keep the application running; capture and tournament controls are available on the web dashboard.
 
 The bundle targets Windows x64. Packaged tests on the build PC verify bundled OCR models, native dependencies, HTTP/SSE, Qt, and startup with Python removed from PATH. A clean-machine test on the laptop is still required.
 
@@ -26,7 +26,7 @@ Best-effort live scoring is enabled by default. Readable username, rarity, weigh
 
 ## Overlay and LAN access
 
-Use the displayed OBS Overlay URL for an OBS Browser Source. `127.0.0.1` works only on the capture computer; another computer needs the laptop's private LAN IP. The admin credential is required for capture setup, screenshots, and score changes. Allow the application through Windows Firewall on your private network if controlling it from another PC.
+Use the displayed OBS Overlay URL for an OBS Browser Source. `127.0.0.1` works only on the capture computer; another computer needs the laptop's private LAN IP. No password is required. Anyone who can reach the server on your private network can access screenshots, capture settings, and tournament controls. Allow the application through Windows Firewall on your private network if controlling it from another PC.
 
 ## Data and cleanup
 
@@ -36,7 +36,7 @@ Runtime data: `%LOCALAPPDATA%\SpaceGoatFisch`. Developer launches use a separate
 - `evidence\*.png` accumulates OCR diagnostic, uncertain-capture, review, and overflow screenshots without automatic expiry. With the application closed, delete older screenshots when no longer needed. This removes evidence, not scores, although history may still reference deleted screenshots. Turn off diagnostic evidence in the application to reduce capture volume; some error/review evidence is still saved.
 - `server.log` rotates at approximately 2 MB with three backups (roughly 8 MB total). Routine cleanup is unnecessary.
 - `tournaments.sqlite3` contains scores, tournaments, and audit history and grows with use. Preserve it unless intentionally discarding history. Its `-wal` and `-shm` files belong to SQLite; do not delete them while running.
-- `config.json` contains the selected region, settings, and admin credential. Preserve it and keep backups private. Initial parser migration backups and startup-error.txt are small.
+- `config.json` contains the selected region and settings. Preserve it and keep backups private. Initial parser migration backups and startup-error.txt are small.
 - On the development PC, `build\SpaceGoatFisch`, `spacegoat-validation`, and `overlay-update-validation` are generated build/test output. They can be removed when not building/testing and no reports or replay captures are needed. `dist` holds the deployable package; `.spacegoat-build` is the reusable build environment. They are not required on the laptop.
 
 Back up the runtime-data folder while the application is closed. Uninstalling or deleting the program folder does not remove tournament history.

@@ -2,6 +2,8 @@
 
 Windows x64 tournament server with OCR, an admin dashboard, and an OBS leaderboard.
 
+The dashboard opens without a password. Anyone who can reach the server on your private network can view screenshots and control capture and tournaments.
+
 ## Clone and run on another laptop
 
 1. Install Git for Windows and Python 3.10 x64 from python.org, including the Python launcher.
@@ -12,12 +14,12 @@ The launcher pulls updates with `git pull --ff-only`, creates `.venv`, installs 
 
 Run offline after setup: `Update-And-Run.bat -SkipUpdate`.
 
-Settings, admin credentials, evidence, and tournament history stay on each laptop in `%LOCALAPPDATA%\SpaceGoatFisch`. Git does not synchronize this data. The existing development launcher uses the separate private `spacegoat-dev-data` folder.
+Settings, evidence, and tournament history stay on each laptop in `%LOCALAPPDATA%\SpaceGoatFisch`. Git does not synchronize this data. The existing development launcher uses the separate private `spacegoat-dev-data` folder.
 
 ## Validation and packaging
 
 - `Update-And-Run.bat -SelfTest`: scoring and lifecycle tests.
-- `Update-And-Run.bat -SmokeTest`: OCR, HTTP, authentication, SSE, and Qt startup/shutdown checks.
+- `Update-And-Run.bat -SmokeTest`: OCR, HTTP, password-free controls, SSE, and Qt startup/shutdown checks.
 - `Update-And-Run.bat -SetupOnly`: prepare dependencies without launching.
 
 Validation writes to `.verification`, separate from tournament data. Live game capture, OBS, and display settings require checks on the target laptop.

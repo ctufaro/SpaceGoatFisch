@@ -10,7 +10,6 @@ import argparse
 import asyncio
 import csv
 import hashlib
-import hmac
 import io
 import ipaddress
 import json
@@ -20,7 +19,6 @@ import os
 from pathlib import Path
 import queue
 import re
-import secrets
 import socket
 import sqlite3
 import sys
@@ -74,7 +72,7 @@ class Config:
             previous_text = self.path.read_text(encoding="utf-8")
             self.values.update(json.loads(previous_text))
             # Only replace the shipped illustrative parser. Keep customized rules,
-            # tokens, selected region, tournament history, and review events intact.
+            # selected region, tournament history, and review events intact.
             if self.values.get("patterns") == [LEGACY_PATTERN] and self.values.get("message_start") == LEGACY_START:
                 backup = self.directory / "config.pre-fisch-samples.json"
                 if not backup.exists():
@@ -86,8 +84,8 @@ class Config:
                 if not backup.exists():
                     backup.write_text(previous_text, encoding="utf-8")
                 self.values["patterns"] = [FISCH_PATTERN]
-        if not self.values.get("admin_token"):
-            self.values["admin_token"] = secrets.token_urlsafe(32)
+        # Discard credentials left by older versions.
+        self.values.pop("admin_token", None)
         self.save()
 
     def snapshot(self):
@@ -1117,33 +1115,32 @@ const source=new EventSource('/stream');source.addEventListener('state',e=>{rend
 
 ADMIN_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SpaceGoat Admin</title><style>__STYLE__ body{background:#071721;padding:22px;max-width:1400px;margin:auto}textarea{width:100%;min-height:80px}input{max-width:240px}pre{white-space:pre-wrap}a{color:#80e9d0}</style></head><body>
 <h1>SpaceGoat Tournament Control</h1><p class="muted">Corrections are audited. Review events contribute zero until confirmed.</p>
-<div class="panel grid"><label>Admin credential<input id="token" type="password" autocomplete="off"></label><button id="unlock">Unlock dashboard</button><span id="auth"></span></div><div id="error" class="error"></div>
-<div id="private" hidden><div class="panel"><h2 id="title"></h2><div class="grid"><input id="sessionName" placeholder="New tournament name"><button data-action="create">Create</button><button data-action="start">Start now</button><button data-action="pause">Pause</button><button data-action="resume">Resume</button><button data-action="finish">Finish</button><button data-action="reset">Reset into new session</button><button id="export">Export CSV</button></div><div class="grid" style="margin-top:12px"><label>Start countdown (seconds)<input id="countdownSeconds" type="number" min="1" max="86400" value="60"></label><button id="scheduleStart">Start with countdown</button><button data-action="cancel_countdown">Cancel countdown</button></div><p id="timer" style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums"></p><p class="muted">Create a tournament, then start now or use a countdown. Pause freezes scoring and the elapsed clock; Resume continues both. Finish keeps the final scores. Capture starts automatically when you start or schedule the tournament.</p><div id="stats"></div><table><thead><tr><th>Rank</th><th>Player</th><th>Total kg</th><th>Catches</th><th>Largest</th><th>Average</th><th>Actions</th></tr></thead><tbody id="leaders"></tbody></table></div>
+<div class="panel"><span id="auth">Connected</span></div><div id="error" class="error"></div>
+<div id="private"><div class="panel"><h2 id="title"></h2><div class="grid"><input id="sessionName" placeholder="New tournament name"><button data-action="create">Create</button><button data-action="start">Start now</button><button data-action="pause">Pause</button><button data-action="resume">Resume</button><button data-action="finish">Finish</button><button data-action="reset">Reset into new session</button><button id="export">Export CSV</button></div><div class="grid" style="margin-top:12px"><label>Start countdown (seconds)<input id="countdownSeconds" type="number" min="1" max="86400" value="60"></label><button id="scheduleStart">Start with countdown</button><button data-action="cancel_countdown">Cancel countdown</button></div><p id="timer" style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums"></p><p class="muted">Create a tournament, then start now or use a countdown. Pause freezes scoring and the elapsed clock; Resume continues both. Finish keeps the final scores. Capture starts automatically when you start or schedule the tournament.</p><div id="stats"></div><table><thead><tr><th>Rank</th><th>Player</th><th>Total kg</th><th>Catches</th><th>Largest</th><th>Average</th><th>Actions</th></tr></thead><tbody id="leaders"></tbody></table></div>
 <div class="panel"><h2>Player name corrections</h2><p class="muted">Everyone joins automatically when a readable catch appears. Add corrections only when needed: wrongName-&gt;correctUsername, one per line. Saving merges matching scores in the current tournament and corrects future catches. No registration is required.</p><textarea id="roster" placeholder="FifthSparkGMZZ-&gt;FifthSparkGMZ"></textarea><button id="rosterSave">Save corrections</button><div class="grid" style="margin-top:12px"><label>Incorrect name<input id="correctionSource" placeholder="FifthSparkGMZZ"></label><label>Correct username<input id="correctionTarget" list="playerNames" placeholder="FifthSparkGMZ"></label><datalist id="playerNames"></datalist><button id="addCorrection">Add and save correction</button></div><p id="correctionNotice"></p><p id="kickedPlayers"></p></div><div class="panel"><h2>Overlay rules</h2><label>Rules shown below the timer<textarea id="rulesText" maxlength="2000" placeholder="Common fish only. Highest total weight wins."></textarea></label><button id="rulesSave">Save rules</button></div><div class="panel"><h2>Capture / OCR</h2><p id="captureStatus"></p><div class="grid"><button data-monitor="start">Start capture</button><button data-monitor="stop">Stop capture</button><button data-monitor="restart">Restart capture</button><button data-monitor="preview">Test OCR</button></div><p class="muted">Start now, Resume, and Start with countdown start capture automatically. Keep the game chat visible and unobstructed; place this dashboard on another monitor when possible.</p><details><summary>Chat region setup</summary><p>Select a monitor, load its screenshot, then drag around the catch messages. Click Save chat region. Stop capture before changing the region.</p><div class="grid"><select id="captureMonitor"></select><button id="loadScreen">Load monitor screenshot</button></div><canvas id="regionCanvas" style="display:none;width:100%;max-width:900px;touch-action:none;cursor:crosshair;margin:12px 0"></canvas><div class="grid"><label>Left<input id="regionLeft" type="number"></label><label>Top<input id="regionTop" type="number"></label><label>Width<input id="regionWidth" type="number" min="60"></label><label>Height<input id="regionHeight" type="number" min="30"></label><button id="saveRegion">Save chat region</button></div><p id="regionNotice"></p></details><details><summary>Detailed capture health</summary><pre id="health"></pre></details><details><summary>OCR preview</summary><pre id="preview"></pre></details></div>
 <div class="panel"><h2>Add or correct a catch</h2><div class="grid"><label>Event ID (blank = add)<input id="eventId" readonly></label><label>Username<input id="username"></label><label>Fish<input id="fish"></label><label>Rarity<input id="rarity"></label><label>Weight kg<input id="weight"></label><label>Status<select id="eventStatus"><option>confirmed</option><option>review</option><option>disqualified</option></select></label><label>Reason<input id="reason"></label></div><p><button id="save">Save catch</button> <button id="clear">Clear form</button></p><pre id="evidence"></pre></div>
 <div class="panel"><h2>Catch feed / history</h2><select id="history"></select><button id="previous">Previous</button><button id="next">Next</button><span id="pagination"></span><table><thead><tr><th>ID / time</th><th>Player / fish</th><th>kg</th><th>Confidence</th><th>Status / OCR</th><th>Actions</th></tr></thead><tbody id="events"></tbody></table></div>
 <div class="panel"><h2>Overlay settings</h2><div class="grid"><label>Players<input id="players" type="number" min="1" max="10"></label><label>Scale<input id="scale" type="number" step="0.1" min="0.3" max="3"></label><label>Panel opacity<input id="opacity" type="number" step="0.05" min="0" max="1"></label><label>Vertical<input id="vertical" type="checkbox"></label><label>Recent catches<input id="recent" type="checkbox"></label><button id="overlaySave">Apply overlay</button></div></div>
 <div class="panel"><h2>Parser calibration</h2><p class="muted">The shipped preset matches supplied live-game samples: [System] Player has perfectly caught a Rarity 1.2kg Fish! Modifiers remain in the fish description. Required named groups: username, fish, rarity, weight. Parser changes take effect on future events.</p><label>Patterns (one regex per line)<textarea id="patterns"></textarea></label><label>Message start regex (wrapped-row grouping)<input id="messageStart"></label><div class="grid"><label>Decimal separator<select id="decimal"><option>.</option><option>,</option></select></label><label>Minimum kg<input id="minKg"></label><label>Maximum kg<input id="maxKg"></label><label>Minimum OCR confidence<input id="confidence" type="number" step="0.01" min="0" max="1"></label><label>Best-effort live scoring<input id="bestEffort" type="checkbox"></label><label>Verified with real samples<input id="verified" type="checkbox"></label></div><button id="parserSave">Save parser</button><label>Sample announcement<textarea id="sample"></textarea></label><button id="testParser">Test without recording</button><pre id="parsed"></pre></div></div>
 <script>
-const $=id=>document.getElementById(id);let credential='',offset=0,items=[],activeId=null,editing=false,leaderSnapshot='';
+const $=id=>document.getElementById(id);let offset=0,items=[],activeId=null,editing=false,leaderSnapshot='';
 function err(e){$('error').textContent=e.message||String(e)}
-async function api(path,method='GET',body){const r=await fetch(path,{method,headers:{'Authorization':'Bearer '+credential,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok){let detail=await r.text();throw Error(r.status+' '+detail)}return r.headers.get('content-type').includes('application/json')?r.json():r.text()}
+async function api(path,method='GET',body){const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok){let detail=await r.text();throw Error(r.status+' '+detail)}return r.headers.get('content-type').includes('application/json')?r.json():r.text()}
 function cells(row,values){for(const v of values){const td=document.createElement('td');td.textContent=v;row.append(td)}}
 let timerState=null,timerReceived=0;
 function updateTimer(){if(!timerState)return;const t=timerState.tournament,now=timerState.server_time+(performance.now()-timerReceived)/1000;const fmtTime=x=>{x=Math.max(0,Math.floor(x));return (x>=3600?Math.floor(x/3600)+':':'')+String(Math.floor(x/60)%60).padStart(2,'0')+':'+String(x%60).padStart(2,'0')};let text='Ready to start';if(t.status==='ready'&&t.scheduled_start!=null)text='STARTS IN '+fmtTime(Math.ceil(t.scheduled_start-now));else if(t.status!=='ready'){const elapsed=(t.elapsed_seconds||0)+(t.status==='running'&&t.started_at!=null?Math.max(0,now-t.started_at):0);text=(t.status==='paused'?'PAUSED ':t.status==='finished'?'FINAL TIME ':'ELAPSED ')+fmtTime(elapsed)}$('timer').textContent=text}
 setInterval(updateTimer,100);
 function render(s){timerState=s;timerReceived=performance.now();updateTimer();activeId=s.tournament.id;$('title').textContent=s.tournament.name+' • '+s.tournament.status;$('stats').textContent='Confirmed: '+(s.counts.confirmed||0)+' / Review: '+(s.counts.review||0);const nextLeaders=JSON.stringify([activeId,s.leaderboard]);if(nextLeaders!==leaderSnapshot){leaderSnapshot=nextLeaders;$('leaders').replaceChildren();$('playerNames').replaceChildren();for(const p of s.leaderboard){const option=document.createElement('option');option.value=p.username;$('playerNames').append(option)}for(const p of s.leaderboard){let tr=document.createElement('tr');cells(tr,[p.rank,p.username,p.total_kg.toFixed(3),p.catches,p.largest_kg,p.average_kg.toFixed(3)]);const td=document.createElement('td'),correct=document.createElement('button'),kick=document.createElement('button');correct.textContent='Correct name';correct.onclick=()=>{$('correctionSource').value=p.username;$('correctionTarget').value='';$('correctionTarget').scrollIntoView({behavior:'smooth',block:'center'});$('correctionTarget').focus()};td.append(correct);kick.textContent='Kick';kick.onclick=async()=>{try{await api('/api/players/kick','POST',{username:p.username});render(await api('/api/state'));await feed()}catch(e){err(e)}};td.append(kick);tr.append(td);$('leaders').append(tr)}}$('kickedPlayers').textContent='Kicked this tournament: '+((s.kicked_players||[]).join(', ')||'none');$('captureStatus').textContent=s.health.capture+' | OCR: '+s.health.ocr;$('health').textContent=JSON.stringify({...s.health,preview:undefined},null,2);if(s.health.preview!==undefined)$('preview').textContent=s.health.preview;}
-async function feed(){if(!credential)return;try{$('preview').textContent=(await api('/api/preview')).text;const selected=$('history').value||activeId;const r=await api('/api/events?tournament_id='+selected+'&limit=25&offset='+offset);items=r.items;$('events').replaceChildren();$('pagination').textContent=(offset+1)+'–'+(offset+items.length)+' of '+r.total;
+async function feed(){try{$('preview').textContent=(await api('/api/preview')).text;const selected=$('history').value||activeId;const r=await api('/api/events?tournament_id='+selected+'&limit=25&offset='+offset);items=r.items;$('events').replaceChildren();$('pagination').textContent=(offset+1)+'–'+(offset+items.length)+' of '+r.total;
 for(const p of items){let tr=document.createElement('tr');tr.className=p.status;cells(tr,[p.id+' / '+p.timestamp,p.username+' / '+p.fish,p.weight_kg,Math.round(p.confidence*100)+'% OCR / '+Math.round(p.visual_confidence*100)+'% visual',p.status+' • '+p.reason+'\n'+p.raw_text]);let td=document.createElement('td');let edit=document.createElement('button');edit.textContent='Review / edit';edit.onclick=()=>{for(const [id,key] of [['eventId','id'],['username','username'],['fish','fish'],['rarity','rarity'],['weight','weight_kg'],['eventStatus','status'],['reason','reason']])$(id).value=p[key];$('evidence').textContent='Evidence: '+(p.evidence||'not saved');api('/api/audit/'+p.id).then(a=>$('evidence').textContent+='\nAudit: '+JSON.stringify(a,null,2)).catch(err);window.scrollTo({top:$('eventId').getBoundingClientRect().top+window.scrollY-100,behavior:'smooth'})};let del=document.createElement('button');del.textContent='Delete';del.onclick=async()=>{if(confirm('Remove event '+p.id+' from scoring? History is retained.'))try{await api('/api/events/'+p.id,'DELETE',{reason:'Operator deletion'});await feed()}catch(e){err(e)}};td.append(edit,del);tr.append(td);$('events').append(tr)}}catch(e){err(e)}}
 async function load(){try{render(await api('/api/state'));const config=await api('/api/config');for(const id of ['players','scale','opacity'])$(id).value=config.overlay[id];for(const id of ['vertical','recent'])$(id).checked=config.overlay[id];$('patterns').value=config.patterns.join('\n');$('messageStart').value=config.message_start;$('decimal').value=config.decimal_separator;$('minKg').value=config.min_kg;$('maxKg').value=config.max_kg;$('confidence').value=config.confidence;$('verified').checked=config.parser_verified;$('bestEffort').checked=config.best_effort;$('rulesText').value=config.rules||'';const mappings={...(config.name_corrections||{})};for(const p of config.registered_players||[])for(const alias of p.aliases||[])if(!(alias in mappings))mappings[alias]=p.username;$('roster').value=Object.entries(mappings).map(([from,to])=>from+'->'+to).join('\n');await loadCapture(config);await history();await feed()}catch(e){err(e)}}
 async function history(){const previous=$('history').value;const sessions=await api('/api/history');$('history').replaceChildren();for(const t of sessions){let o=document.createElement('option');o.value=t.id;o.textContent=t.name+' • '+t.status+' • #'+t.id;$('history').append(o)}$('history').value=previous||activeId}
-$('unlock').onclick=async()=>{credential=$('token').value;try{await api('/api/config');$('private').hidden=false;$('auth').textContent='Unlocked';$('error').textContent='';await load()}catch(e){credential='';err(e)}};
 for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{if(['reset','create'].includes(b.dataset.action)&&!confirm('Archive current session and create a new one?'))return;await api('/api/tournament','POST',{action:b.dataset.action,name:$('sessionName').value||'Fisch Weight Championship'});render(await api('/api/state'));$('history').value='';offset=0;await history();await feed()}catch(e){err(e)}};
 const regionFields=['regionLeft','regionTop','regionWidth','regionHeight'];let monitorList=[],screenImage=null,screenMonitor=null,dragStart=null;
 async function loadCapture(config){if(config.region)regionFields.forEach((id,i)=>$(id).value=config.region[i]);monitorList=await api('/api/monitors');$('captureMonitor').replaceChildren();for(const m of monitorList){const option=document.createElement('option');option.value=m.id;option.textContent='Monitor '+m.id+' ('+m.width+' x '+m.height+')';$('captureMonitor').append(option)}}
 for(const button of document.querySelectorAll('[data-monitor]'))button.onclick=async()=>{button.disabled=true;try{await api('/api/monitoring','POST',{action:button.dataset.monitor});render(await api('/api/state'));$('error').textContent=''}catch(e){err(e)}finally{button.disabled=false}};
 $('saveRegion').onclick=async()=>{try{const region=regionFields.map(id=>Number($(id).value));await api('/api/config','PATCH',{region});$('regionNotice').textContent='Chat region saved. Start the tournament or restart capture.';$('error').textContent=''}catch(e){err(e)}};
-$('loadScreen').onclick=async()=>{try{screenMonitor=monitorList.find(m=>m.id===Number($('captureMonitor').value));if(!screenMonitor)throw Error('Select a monitor');const response=await fetch('/api/monitor-image/'+screenMonitor.id,{headers:{Authorization:'Bearer '+credential},cache:'no-store'});if(!response.ok)throw Error('Screenshot failed: '+response.status);const url=URL.createObjectURL(await response.blob());const picture=new Image();try{picture.src=url;await picture.decode();screenImage=picture;const canvas=$('regionCanvas');canvas.width=picture.naturalWidth;canvas.height=picture.naturalHeight;canvas.style.display='block';canvas.getContext('2d').drawImage(picture,0,0)}finally{URL.revokeObjectURL(url)}}catch(e){err(e)}};
+$('loadScreen').onclick=async()=>{try{screenMonitor=monitorList.find(m=>m.id===Number($('captureMonitor').value));if(!screenMonitor)throw Error('Select a monitor');const response=await fetch('/api/monitor-image/'+screenMonitor.id,{cache:'no-store'});if(!response.ok)throw Error('Screenshot failed: '+response.status);const url=URL.createObjectURL(await response.blob());const picture=new Image();try{picture.src=url;await picture.decode();screenImage=picture;const canvas=$('regionCanvas');canvas.width=picture.naturalWidth;canvas.height=picture.naturalHeight;canvas.style.display='block';canvas.getContext('2d').drawImage(picture,0,0)}finally{URL.revokeObjectURL(url)}}catch(e){err(e)}};
 const canvas=$('regionCanvas');const point=e=>{const rect=canvas.getBoundingClientRect();return {x:Math.max(0,Math.min(canvas.width,(e.clientX-rect.left)*canvas.width/rect.width)),y:Math.max(0,Math.min(canvas.height,(e.clientY-rect.top)*canvas.height/rect.height))}};
 canvas.onpointerdown=e=>{if(!screenImage)return;dragStart=point(e);canvas.setPointerCapture(e.pointerId)};
 canvas.onpointermove=e=>{if(!dragStart)return;const end=point(e),ctx=canvas.getContext('2d');ctx.drawImage(screenImage,0,0);ctx.strokeStyle='#7eeac3';ctx.lineWidth=4;ctx.strokeRect(dragStart.x,dragStart.y,end.x-dragStart.x,end.y-dragStart.y)};
@@ -1161,7 +1158,7 @@ $('export').onclick=async()=>{try{const text=await api('/api/export?tournament_i
 $('overlaySave').onclick=async()=>{try{await api('/api/config','PATCH',{overlay:{players:Number($('players').value),scale:Number($('scale').value),opacity:Number($('opacity').value),vertical:$('vertical').checked,recent:$('recent').checked}})}catch(e){err(e)}};
 $('parserSave').onclick=async()=>{try{await api('/api/config','PATCH',{patterns:$('patterns').value.split('\n').filter(x=>x.trim()),message_start:$('messageStart').value,decimal_separator:$('decimal').value,min_kg:$('minKg').value,max_kg:$('maxKg').value,confidence:Number($('confidence').value),parser_verified:$('verified').checked,best_effort:$('bestEffort').checked})}catch(e){err(e)}};
 $('testParser').onclick=async()=>{try{$('parsed').textContent=JSON.stringify(await api('/api/parse','POST',{text:$('sample').value}),null,2)}catch(e){err(e)}};
-const stream=new EventSource('/stream');stream.addEventListener('state',e=>{if(credential)render(JSON.parse(e.data))});stream.onerror=()=>{$('auth').textContent='Connection interrupted • reconnecting'};setInterval(feed,3000);
+const stream=new EventSource('/stream');stream.addEventListener('state',e=>{render(JSON.parse(e.data))});stream.onerror=()=>{$('auth').textContent='Connection interrupted • reconnecting'};setInterval(feed,3000);load();
 </script></body></html>""".replace("__STYLE__", WEB_STYLE)
 
 
@@ -1231,19 +1228,8 @@ def create_app(runtime):
     # FastAPI resolves annotations against module globals, including in frozen builds.
     globals()["Request"] = Request
     app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, openapi_url=None)
-    attempts = {}
 
-    def authenticate(request):
-        client = request.client.host if request.client else "unknown"
-        window, count = attempts.get(client, (time.monotonic(), 0))
-        if time.monotonic() - window > 60:
-            window, count = time.monotonic(), 0
-        if count >= 15:
-            raise HTTPException(429, "Too many failed credentials; wait one minute")
-        supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
-        if not hmac.compare_digest(supplied.encode("utf-8"), runtime.config.snapshot()["admin_token"].encode("utf-8")):
-            attempts[client] = (window, count+1)
-            raise HTTPException(401, "Enter the credential displayed on the SpaceGoat laptop")
+    def check_origin(request):
         if request.method != "GET":
             origin = request.headers.get("origin")
             if origin and origin != f"http://{request.headers.get('host')}":
@@ -1282,29 +1268,29 @@ def create_app(runtime):
 
     @app.get("/api/state")
     def state():
-        # Read-only OBS clients receive scoring and health, but no raw OCR/credential.
+        # Read-only OBS clients receive scoring and health, but no raw OCR.
         result = runtime.state()
         result["health"].pop("preview", None)
         return result
 
     @app.get("/api/events")
     def events(request: Request, tournament_id: int | None = None, limit: int = 50, offset: int = 0):
-        authenticate(request)
+        check_origin(request)
         return runtime.store.events(tournament_id, max(1, min(limit, 200)), max(0, offset))
 
     @app.get("/api/history")
     def history(request: Request):
-        authenticate(request)
+        check_origin(request)
         return runtime.store.history()
 
     @app.get("/api/audit/{event_id}")
     def audit(event_id: int, request: Request):
-        authenticate(request)
+        check_origin(request)
         return runtime.store.audits(event_id)
 
     @app.get("/api/evidence/{filename}")
     def evidence(filename: str, request: Request):
-        authenticate(request)
+        check_origin(request)
         if not re.fullmatch(r"[a-zA-Z0-9_-]+\.png", filename):
             raise HTTPException(400, "Invalid evidence name")
         path = runtime.config.directory / "evidence" / filename
@@ -1314,7 +1300,7 @@ def create_app(runtime):
 
     @app.get("/api/export")
     def export(request: Request, tournament_id: int | None = None):
-        authenticate(request)
+        check_origin(request)
         stream = io.StringIO(newline="")
         fields = ["id", "username", "fish", "rarity", "weight_kg", "timestamp", "status", "confidence", "reason", "raw_text", "evidence"]
         writer = csv.DictWriter(stream, fields, extrasaction="ignore")
@@ -1332,18 +1318,18 @@ def create_app(runtime):
 
     @app.get("/api/config")
     def config(request: Request):
-        authenticate(request)
+        check_origin(request)
         settings = runtime.config.snapshot()
-        settings.pop("admin_token")
+        settings.pop("admin_token", None)
         return settings
 
     @app.get("/api/preview")
     def preview(request: Request):
-        authenticate(request)
+        check_origin(request)
         return {"text": runtime.state()["health"]["preview"]}
 
     async def body(request):
-        authenticate(request)
+        check_origin(request)
         payload = await request.json()
         if not isinstance(payload, dict):
             raise HTTPException(400, "JSON object required")
@@ -1436,14 +1422,14 @@ def create_app(runtime):
 
     @app.get("/api/monitors")
     def monitors(request: Request):
-        authenticate(request)
+        check_origin(request)
         import mss
         with mss.mss() as capture:
             return [{"id":i,**m} for i,m in enumerate(capture.monitors) if i]
 
     @app.get("/api/monitor-image/{monitor_id}")
     def monitor_image(monitor_id: int,request: Request):
-        authenticate(request)
+        check_origin(request)
         import mss
         from fastapi.responses import Response
         with mss.mss() as capture:
@@ -1591,13 +1577,10 @@ def launch_gui(runtime, host, port, smoke=False):
             form = QFormLayout()
             layout.addLayout(form)
             for caption, value in (("LAN IP Address", host), ("OBS Overlay URL", f"http://{host}:{port}/overlay"),
-                                   ("Admin Dashboard URL", f"http://{host}:{port}/admin"),
-                                   ("Admin credential", runtime.config.snapshot()["admin_token"])):
+                                   ("Admin Dashboard URL", f"http://{host}:{port}/admin")):
                 row = QHBoxLayout()
                 field = QLineEdit(value)
                 field.setReadOnly(True)
-                if caption == "Admin credential":
-                    field.setEchoMode(QLineEdit.EchoMode.Password)
                 row.addWidget(field)
                 button = QPushButton("Copy")
                 button.clicked.connect(lambda checked=False, v=value: app.clipboard().setText(v))
@@ -2206,11 +2189,13 @@ def self_test(directory=None):
 
         def test_shipped_parser_migration_preserves_customization(self):
             self.config.update({"patterns":[LEGACY_PATTERN],"message_start":LEGACY_START,"parser_verified":False})
-            token = self.config.snapshot()["admin_token"]
+            self.config.values["admin_token"] = "legacy-test-token"
+            self.config.save()
             migrated = Config(self.tmp.name).snapshot()
             self.assertEqual(migrated["patterns"],[FISCH_PATTERN])
             self.assertTrue(migrated["parser_verified"])
-            self.assertEqual(migrated["admin_token"],token)
+            self.assertNotIn("admin_token", migrated)
+            self.assertNotIn("admin_token", json.loads(self.config.path.read_text(encoding="utf-8")))
             self.assertTrue(Path(self.tmp.name,"config.pre-fisch-samples.json").is_file())
             self.config.update({"patterns":[r"^custom (?P<username>.+) (?P<fish>.+) (?P<rarity>.+) (?P<weight>.+)$"]})
             self.assertEqual(Config(self.tmp.name).snapshot()["patterns"],self.config.snapshot()["patterns"])
@@ -2347,21 +2332,16 @@ def smoke_test(directory):
             assert urllib.request.urlopen(base+"/overlay",timeout=5).status==200
             assert urllib.request.urlopen(base+"/admin",timeout=5).status==200
             import urllib.error
-            try:
-                urllib.request.urlopen(urllib.request.Request(base+"/api/tournament", data=b'{"action":"start"}',
-                    headers={"Content-Type":"application/json"},method="POST"),timeout=5)
-                raise AssertionError("Unauthenticated mutation accepted")
-            except urllib.error.HTTPError as exc:
-                assert exc.code == 401
-            auth={"Authorization":"Bearer "+config.snapshot()["admin_token"]}
-            req=urllib.request.Request(base+"/api/config",headers=auth)
+            req=urllib.request.Request(base+"/api/tournament", data=b'{"action":"create"}', headers={"Content-Type":"application/json"}, method="POST")
+            assert json.load(urllib.request.urlopen(req,timeout=5))["ok"]
+            req=urllib.request.Request(base+"/api/config")
             assert "admin_token" not in json.load(urllib.request.urlopen(req,timeout=5))
-            req=urllib.request.Request(base+"/api/events",data=json.dumps({"username":"PlayerA","fish":"Carp","rarity":"Rare","weight_kg":"10.5"}).encode(),headers=auth|{"Content-Type":"application/json"},method="POST")
+            req=urllib.request.Request(base+"/api/events",data=json.dumps({"username":"PlayerA","fish":"Carp","rarity":"Rare","weight_kg":"10.5"}).encode(),headers={"Content-Type":"application/json"},method="POST")
             event_id=json.load(urllib.request.urlopen(req,timeout=5))["id"]
             assert event_id==1
             try:
                 urllib.request.urlopen(urllib.request.Request(base+"/api/tournament",data=b'{"action":"start"}',
-                    headers=auth|{"Content-Type":"application/json","Origin":"http://evil.example"},method="POST"),timeout=5)
+                    headers={"Content-Type":"application/json","Origin":"http://evil.example"},method="POST"),timeout=5)
                 raise AssertionError("Cross-origin mutation accepted")
             except urllib.error.HTTPError as exc:
                 assert exc.code == 403
@@ -2369,28 +2349,23 @@ def smoke_test(directory):
                 assert stream.readline().decode().strip()=="event: state"
                 data=json.loads(stream.readline().decode().removeprefix("data: "))
                 assert data["leaderboard"][0]["total_kg"]==10.5
-            req=urllib.request.Request(base+"/api/config",data=json.dumps({"registered_players":[{"username":"PlayerA"},{"username":"FifthSparkGMZ"}],"name_corrections":{"FifthSparkGMZZ":"FifthSparkGMZ"},"rules":"Common fish only\nHighest weight wins"}).encode(),headers=auth|{"Content-Type":"application/json"},method="PATCH")
+            req=urllib.request.Request(base+"/api/config",data=json.dumps({"registered_players":[{"username":"PlayerA"},{"username":"FifthSparkGMZ"}],"name_corrections":{"FifthSparkGMZZ":"FifthSparkGMZ"},"rules":"Common fish only\nHighest weight wins"}).encode(),headers={"Content-Type":"application/json"},method="PATCH")
             assert json.load(urllib.request.urlopen(req,timeout=5))["ok"]
-            req=urllib.request.Request(base+"/api/parse",data=json.dumps({"text":"[System] F FifthSparkG MZ Z has perfectly caught a Common ( 0.6kg Plagued Anchovy!"}).encode(),headers=auth|{"Content-Type":"application/json"},method="POST")
+            req=urllib.request.Request(base+"/api/parse",data=json.dumps({"text":"[System] F FifthSparkG MZ Z has perfectly caught a Common ( 0.6kg Plagued Anchovy!"}).encode(),headers={"Content-Type":"application/json"},method="POST")
             parsed=json.load(urllib.request.urlopen(req,timeout=5))
             assert parsed["username"]=="FifthSparkGMZ" and parsed["status"]=="confirmed"
-            req=urllib.request.Request(base+"/api/parse",data=json.dumps({"text":"[System] NewPlayer has caught a Common 3.3kg Trout!"}).encode(),headers=auth|{"Content-Type":"application/json"},method="POST")
+            req=urllib.request.Request(base+"/api/parse",data=json.dumps({"text":"[System] NewPlayer has caught a Common 3.3kg Trout!"}).encode(),headers={"Content-Type":"application/json"},method="POST")
             parsed=json.load(urllib.request.urlopen(req,timeout=5))
             assert parsed["username"]=="NewPlayer" and parsed["status"]=="confirmed"
-            req=urllib.request.Request(base+"/api/players/kick",data=b'{"username":"PlayerA"}',headers=auth|{"Content-Type":"application/json"},method="POST")
+            req=urllib.request.Request(base+"/api/players/kick",data=b'{"username":"PlayerA"}',headers={"Content-Type":"application/json"},method="POST")
             assert json.load(urllib.request.urlopen(req,timeout=5))["ok"]
             state=json.load(urllib.request.urlopen(base+"/api/state",timeout=5))
             assert state["leaderboard"]==[] and state["kicked_players"]==["PlayerA"]
             assert state["rules"]=="Common fish only\nHighest weight wins"
-            try:
-                urllib.request.urlopen(urllib.request.Request(base+"/api/players/kick",data=b'{"username":"PlayerA"}',headers={"Content-Type":"application/json"},method="POST"),timeout=5)
-                raise AssertionError("Unauthenticated kick accepted")
-            except urllib.error.HTTPError as exc:
-                assert exc.code==401
             launch_gui(runtime,"127.0.0.1",port,smoke=True)
         finally:
             runtime.close();thread.join(timeout=10)
-        report="PASS: packaged models load offline; synthetic OCR recognizes player/fish; HTTP routes; authenticated mutation; full SSE snapshot; name corrections and automatic joining, rules and authenticated kick; Qt window launches and closes.\nOCR: "+recognized+"\nClean Windows without Python and real two-player Fisch: NOT VERIFIED.\n"
+        report="PASS: packaged models load offline; synthetic OCR recognizes player/fish; HTTP routes; password-free mutation and cross-origin protection; full SSE snapshot; name corrections and automatic joining, rules and password-free kick; Qt window launches and closes.\nOCR: "+recognized+"\nClean Windows without Python and real two-player Fisch: NOT VERIFIED.\n"
         Path(directory,"smoke-results.txt").write_text(report,encoding="utf-8")
         if sys.stdout:
             print(report)
