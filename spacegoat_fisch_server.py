@@ -42,6 +42,14 @@ LEGACY_START = r"^(?:\[[^\]]+\]\s*)?[A-Za-z0-9_]{3,20}\s+caught\b"
 PREVIOUS_FISCH_PATTERN = r"^\[\s*System\s*\]\s*(?P<username>[A-Za-z0-9_]{3,20})\s+has\s+perfectly\s+caught\s+an?\s+(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)\s+(?P<weight>[\d.,\s]+)\s*kg\s+(?P<fish>.+?)\s*(?:!\.?|\.)$"
 FISCH_PATTERN = r"^\[\s*System\s*\]\s*(?P<username>[A-Za-z0-9_]{3,20}?)\s*has\s*(?:perfectly\s*)?caught\s*an?\s*(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)\s*(?P<weight>[\d.,\s]+)\s*kg\s*(?P<fish>.+?)\s*[!.]+$"
 FISCH_START = r"^\s*\[\s*System\s*\]"
+COMMON_FISH_PATTERN = r'''^\[\s*System\s*\]\s*(?:[A-Za-z]\s+)?(?P<username>[A-Za-z0-9_]{3,20}?)(?:\s+[A-Za-z|])?\s*has\s*(?:s\s+)?(?:perfectly\s*)?caught\s*(?:t\s*)?an?\s*[(:'";’]*\s*(?P<rarity>Common)\s*[(:'";’]*\s*(?:[A-Za-z&|]\s+)?(?:\d{1,2}\s+(?=(?:\d{1,2}|\d{4,})\.\d+\s*kg))?(?P<weight>[\d.,\s]+)\s*kg\s*(?P<fish>.+?)\s*[!.]+$'''
+ALL_RARITIES_PATTERN = r'''^\[\s*System\s*\]\s*(?:[A-Za-z]\s+)?(?P<username>[A-Za-z0-9_]{3,20}?)\s*(?:[I|hl]\s+)?has\s*(?:s\s+)?(?:perfectly\s*)?caught\s*(?:t\s+)?an?\s*[(:'";’]*\s*(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)\s*[(:'";’]*\s*(?:\d{1,2}\s+(?=(?:\d{1,2}|\d{4,})\.\d+\s*kg))?(?P<weight>[\d.,\s]+)\s*kg\s*(?P<fish>.+?)\s*[!.]+$'''
+NAMED_PATTERNS = [
+    {"name": "Common Fish", "pattern": COMMON_FISH_PATTERN},
+    {"name": "All Rarities", "pattern": ALL_RARITIES_PATTERN},
+    {"name": "Limited Fish", "pattern": ALL_RARITIES_PATTERN.replace(
+        "(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)", "(?P<rarity>Limited)")},
+]
 DEFAULTS = {
     "region": None, "host": "", "port": 8765, "fps": 12,
     "frame_queue": 24, "ocr_queue": 64, "diagnostic": False,
@@ -86,6 +94,11 @@ class Config:
                 self.values["patterns"] = [FISCH_PATTERN]
         # Discard credentials left by older versions.
         self.values.pop("admin_token", None)
+        if "pattern_presets" not in self.values:
+            self.values["pattern_presets"] = json.loads(json.dumps(NAMED_PATTERNS))
+            for pattern in self.values["patterns"]:
+                if not any(p["pattern"] == pattern for p in self.values["pattern_presets"]):
+                    self.values["pattern_presets"].append({"name": "Existing pattern " + str(len(self.values["pattern_presets"]) - 2), "pattern": pattern})
         self.save()
 
     def snapshot(self):
@@ -208,6 +221,9 @@ def parse_catch(raw, confidence, visual_confidence, settings):
         normalized = re.sub(r"(\b(?:Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine))\s+[A-Za-z|]\s+(?=\d)",r"\1 ",normalized,flags=re.IGNORECASE)
     matches = [m.groupdict() for p in settings["patterns"]
                if (m := re.fullmatch(p, normalized, re.IGNORECASE))]
+    # Overlapping named patterns may extract the same catch. Keep disagreements
+    # ambiguous, but do not send identical extractions to review.
+    matches = [dict(fields) for fields in dict.fromkeys(tuple(m.items()) for m in matches)]
     result = {"username": "", "fish": "", "rarity": "", "weight_units": 0,
               "status": "review", "reason": "No configured announcement pattern matched",
               "raw_text": raw, "confidence": float(confidence),
@@ -1121,7 +1137,7 @@ ADMIN_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="vi
 <div class="panel"><h2>Add or correct a catch</h2><div class="grid"><label>Event ID (blank = add)<input id="eventId" readonly></label><label>Username<input id="username"></label><label>Fish<input id="fish"></label><label>Rarity<input id="rarity"></label><label>Weight kg<input id="weight"></label><label>Status<select id="eventStatus"><option>confirmed</option><option>review</option><option>disqualified</option></select></label><label>Reason<input id="reason"></label></div><p><button id="save">Save catch</button> <button id="clear">Clear form</button></p><pre id="evidence"></pre></div>
 <div class="panel"><h2>Catch feed / history</h2><select id="history"></select><button id="previous">Previous</button><button id="next">Next</button><span id="pagination"></span><table><thead><tr><th>ID / time</th><th>Player / fish</th><th>kg</th><th>Confidence</th><th>Status / OCR</th><th>Actions</th></tr></thead><tbody id="events"></tbody></table></div>
 <div class="panel"><h2>Overlay settings</h2><div class="grid"><label>Players<input id="players" type="number" min="1" max="10"></label><label>Scale<input id="scale" type="number" step="0.1" min="0.3" max="3"></label><label>Panel opacity<input id="opacity" type="number" step="0.05" min="0" max="1"></label><label>Vertical<input id="vertical" type="checkbox"></label><label>Recent catches<input id="recent" type="checkbox"></label><button id="overlaySave">Apply overlay</button></div></div>
-<div class="panel"><h2>Parser calibration</h2><p class="muted">The shipped preset matches supplied live-game samples: [System] Player has perfectly caught a Rarity 1.2kg Fish! Modifiers remain in the fish description. Required named groups: username, fish, rarity, weight. Parser changes take effect on future events.</p><label>Patterns (one regex per line)<textarea id="patterns"></textarea></label><label>Message start regex (wrapped-row grouping)<input id="messageStart"></label><div class="grid"><label>Decimal separator<select id="decimal"><option>.</option><option>,</option></select></label><label>Minimum kg<input id="minKg"></label><label>Maximum kg<input id="maxKg"></label><label>Minimum OCR confidence<input id="confidence" type="number" step="0.01" min="0" max="1"></label><label>Best-effort live scoring<input id="bestEffort" type="checkbox"></label><label>Verified with real samples<input id="verified" type="checkbox"></label></div><button id="parserSave">Save parser</button><label>Sample announcement<textarea id="sample"></textarea></label><button id="testParser">Test without recording</button><pre id="parsed"></pre></div></div>
+<div class="panel"><h2>Parser calibration</h2><p class="muted">The shipped preset matches supplied live-game samples: [System] Player has perfectly caught a Rarity 1.2kg Fish! Modifiers remain in the fish description. Required named groups: username, fish, rarity, weight. Parser changes take effect on future events.</p><h3>Patterns</h3><p class="muted">Give each regex a friendly name. Enable the patterns to use for future catches (1-12 active). Changes apply when you save the parser.</p><div id="patterns"></div><button id="addPattern" type="button">Add pattern</button><span id="patternStatus" role="status"></span><label>Message start regex (wrapped-row grouping)<input id="messageStart"></label><div class="grid"><label>Decimal separator<select id="decimal"><option>.</option><option>,</option></select></label><label>Minimum kg<input id="minKg"></label><label>Maximum kg<input id="maxKg"></label><label>Minimum OCR confidence<input id="confidence" type="number" step="0.01" min="0" max="1"></label><label>Best-effort live scoring<input id="bestEffort" type="checkbox"></label><label>Verified with real samples<input id="verified" type="checkbox"></label></div><button id="parserSave">Save parser</button><label>Sample announcement<textarea id="sample"></textarea></label><button id="testParser">Test without recording</button><pre id="parsed"></pre></div></div>
 <script>
 const $=id=>document.getElementById(id);let offset=0,items=[],activeId=null,editing=false,leaderSnapshot='';
 function err(e){$('error').textContent=e.message||String(e)}
@@ -1133,7 +1149,7 @@ setInterval(updateTimer,100);
 function render(s){timerState=s;timerReceived=performance.now();updateTimer();activeId=s.tournament.id;$('title').textContent=s.tournament.name+' • '+s.tournament.status;$('stats').textContent='Confirmed: '+(s.counts.confirmed||0)+' / Review: '+(s.counts.review||0);const nextLeaders=JSON.stringify([activeId,s.leaderboard]);if(nextLeaders!==leaderSnapshot){leaderSnapshot=nextLeaders;$('leaders').replaceChildren();$('playerNames').replaceChildren();for(const p of s.leaderboard){const option=document.createElement('option');option.value=p.username;$('playerNames').append(option)}for(const p of s.leaderboard){let tr=document.createElement('tr');cells(tr,[p.rank,p.username,p.total_kg.toFixed(3),p.catches,p.largest_kg,p.average_kg.toFixed(3)]);const td=document.createElement('td'),correct=document.createElement('button'),kick=document.createElement('button');correct.textContent='Correct name';correct.onclick=()=>{$('correctionSource').value=p.username;$('correctionTarget').value='';$('correctionTarget').scrollIntoView({behavior:'smooth',block:'center'});$('correctionTarget').focus()};td.append(correct);kick.textContent='Kick';kick.onclick=async()=>{try{await api('/api/players/kick','POST',{username:p.username});render(await api('/api/state'));await feed()}catch(e){err(e)}};td.append(kick);tr.append(td);$('leaders').append(tr)}}$('kickedPlayers').textContent='Kicked this tournament: '+((s.kicked_players||[]).join(', ')||'none');$('captureStatus').textContent=s.health.capture+' | OCR: '+s.health.ocr;$('health').textContent=JSON.stringify({...s.health,preview:undefined},null,2);if(s.health.preview!==undefined)$('preview').textContent=s.health.preview;}
 async function feed(){try{$('preview').textContent=(await api('/api/preview')).text;const selected=$('history').value||activeId;const r=await api('/api/events?tournament_id='+selected+'&limit=25&offset='+offset);items=r.items;$('events').replaceChildren();$('pagination').textContent=(offset+1)+'–'+(offset+items.length)+' of '+r.total;
 for(const p of items){let tr=document.createElement('tr');tr.className=p.status;cells(tr,[p.id+' / '+p.timestamp,p.username+' / '+p.fish,p.weight_kg,Math.round(p.confidence*100)+'% OCR / '+Math.round(p.visual_confidence*100)+'% visual',p.status+' • '+p.reason+'\n'+p.raw_text]);let td=document.createElement('td');let edit=document.createElement('button');edit.textContent='Review / edit';edit.onclick=()=>{for(const [id,key] of [['eventId','id'],['username','username'],['fish','fish'],['rarity','rarity'],['weight','weight_kg'],['eventStatus','status'],['reason','reason']])$(id).value=p[key];$('evidence').textContent='Evidence: '+(p.evidence||'not saved');api('/api/audit/'+p.id).then(a=>$('evidence').textContent+='\nAudit: '+JSON.stringify(a,null,2)).catch(err);window.scrollTo({top:$('eventId').getBoundingClientRect().top+window.scrollY-100,behavior:'smooth'})};let del=document.createElement('button');del.textContent='Delete';del.onclick=async()=>{if(confirm('Remove event '+p.id+' from scoring? History is retained.'))try{await api('/api/events/'+p.id,'DELETE',{reason:'Operator deletion'});await feed()}catch(e){err(e)}};td.append(edit,del);tr.append(td);$('events').append(tr)}}catch(e){err(e)}}
-async function load(){try{render(await api('/api/state'));const config=await api('/api/config');for(const id of ['players','scale','opacity'])$(id).value=config.overlay[id];for(const id of ['vertical','recent'])$(id).checked=config.overlay[id];$('patterns').value=config.patterns.join('\n');$('messageStart').value=config.message_start;$('decimal').value=config.decimal_separator;$('minKg').value=config.min_kg;$('maxKg').value=config.max_kg;$('confidence').value=config.confidence;$('verified').checked=config.parser_verified;$('bestEffort').checked=config.best_effort;$('rulesText').value=config.rules||'';const mappings={...(config.name_corrections||{})};for(const p of config.registered_players||[])for(const alias of p.aliases||[])if(!(alias in mappings))mappings[alias]=p.username;$('roster').value=Object.entries(mappings).map(([from,to])=>from+'->'+to).join('\n');await loadCapture(config);await history();await feed()}catch(e){err(e)}}
+async function load(){try{render(await api('/api/state'));const config=await api('/api/config');for(const id of ['players','scale','opacity'])$(id).value=config.overlay[id];for(const id of ['vertical','recent'])$(id).checked=config.overlay[id];loadPatterns(config);$('messageStart').value=config.message_start;$('decimal').value=config.decimal_separator;$('minKg').value=config.min_kg;$('maxKg').value=config.max_kg;$('confidence').value=config.confidence;$('verified').checked=config.parser_verified;$('bestEffort').checked=config.best_effort;$('rulesText').value=config.rules||'';const mappings={...(config.name_corrections||{})};for(const p of config.registered_players||[])for(const alias of p.aliases||[])if(!(alias in mappings))mappings[alias]=p.username;$('roster').value=Object.entries(mappings).map(([from,to])=>from+'->'+to).join('\n');await loadCapture(config);await history();await feed()}catch(e){err(e)}}
 async function history(){const previous=$('history').value;const sessions=await api('/api/history');$('history').replaceChildren();for(const t of sessions){let o=document.createElement('option');o.value=t.id;o.textContent=t.name+' • '+t.status+' • #'+t.id;$('history').append(o)}$('history').value=previous||activeId}
 for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{if(['reset','create'].includes(b.dataset.action)&&!confirm('Archive current session and create a new one?'))return;await api('/api/tournament','POST',{action:b.dataset.action,name:$('sessionName').value||'Fisch Weight Championship'});render(await api('/api/state'));$('history').value='';offset=0;await history();await feed()}catch(e){err(e)}};
 const regionFields=['regionLeft','regionTop','regionWidth','regionHeight'];let monitorList=[],screenImage=null,screenMonitor=null,dragStart=null;
@@ -1156,14 +1172,25 @@ $('clear').onclick=()=>{for(const id of ['eventId','username','fish','rarity','w
 $('history').onchange=()=>{offset=0;feed()};$('previous').onclick=()=>{offset=Math.max(0,offset-25);feed()};$('next').onclick=()=>{offset+=25;feed()};
 $('export').onclick=async()=>{try{const text=await api('/api/export?tournament_id='+$('history').value);let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/csv'}));a.download='spacegoat-catches.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}catch(e){err(e)}};
 $('overlaySave').onclick=async()=>{try{await api('/api/config','PATCH',{overlay:{players:Number($('players').value),scale:Number($('scale').value),opacity:Number($('opacity').value),vertical:$('vertical').checked,recent:$('recent').checked}})}catch(e){err(e)}};
-$('parserSave').onclick=async()=>{try{await api('/api/config','PATCH',{patterns:$('patterns').value.split('\n').filter(x=>x.trim()),message_start:$('messageStart').value,decimal_separator:$('decimal').value,min_kg:$('minKg').value,max_kg:$('maxKg').value,confidence:Number($('confidence').value),parser_verified:$('verified').checked,best_effort:$('bestEffort').checked})}catch(e){err(e)}};
+function addPatternRow(name='',pattern='',enabled=false){
+ const row=document.createElement('fieldset');row.className='patternEntry';
+ const activeLabel=document.createElement('label'),active=document.createElement('input');active.type='checkbox';active.checked=enabled;active.className='patternEnabled';activeLabel.append(active,document.createTextNode(' Enabled'));
+ const nameLabel=document.createElement('label'),nameInput=document.createElement('input');nameInput.className='patternName';nameInput.value=name;nameInput.maxLength=80;nameLabel.append(document.createTextNode('Friendly name'),nameInput);
+ const regexLabel=document.createElement('label'),regex=document.createElement('textarea');regex.className='patternRegex';regex.value=pattern;regex.maxLength=2000;regex.spellcheck=false;regexLabel.append(document.createTextNode('Regex expression'),regex);
+ const remove=document.createElement('button');remove.type='button';remove.textContent='Remove';remove.onclick=()=>{row.remove();$('patternStatus').textContent='Unsaved changes; click Save parser to apply.'};
+ row.append(activeLabel,nameLabel,regexLabel,remove);row.oninput=()=>{$('patternStatus').textContent='Unsaved changes; click Save parser to apply.'};$('patterns').append(row);return nameInput;
+}
+function loadPatterns(config){$('patterns').replaceChildren();const entries=[...(config.pattern_presets||[])];for(const pattern of config.patterns)if(!entries.some(p=>p.pattern===pattern))entries.push({name:'Existing pattern '+(entries.length+1),pattern});for(const entry of entries)addPatternRow(entry.name,entry.pattern,config.patterns.includes(entry.pattern));$('patternStatus').textContent=''}
+function patternSettings(){const pattern_presets=Array.from($('patterns').children,row=>({name:row.querySelector('.patternName').value.trim(),pattern:row.querySelector('.patternRegex').value}));const patterns=Array.from($('patterns').children).filter(row=>row.querySelector('.patternEnabled').checked).map(row=>row.querySelector('.patternRegex').value);return {patterns,pattern_presets}}
+$('addPattern').onclick=()=>{if($('patterns').children.length>=50){err(Error('Provide at most 50 named patterns'));return}addPatternRow().focus();$('patternStatus').textContent='Unsaved changes; click Save parser to apply.'};
+$('parserSave').onclick=async()=>{try{await api('/api/config','PATCH',{...patternSettings(),message_start:$('messageStart').value,decimal_separator:$('decimal').value,min_kg:$('minKg').value,max_kg:$('maxKg').value,confidence:Number($('confidence').value),parser_verified:$('verified').checked,best_effort:$('bestEffort').checked});$('patternStatus').textContent='Parser saved.'}catch(e){err(e)}};
 $('testParser').onclick=async()=>{try{$('parsed').textContent=JSON.stringify(await api('/api/parse','POST',{text:$('sample').value}),null,2)}catch(e){err(e)}};
 const stream=new EventSource('/stream');stream.addEventListener('state',e=>{render(JSON.parse(e.data))});stream.onerror=()=>{$('auth').textContent='Connection interrupted • reconnecting'};setInterval(feed,3000);load();
 </script></body></html>""".replace("__STYLE__", WEB_STYLE)
 
 
 def validate_config(update, current):
-    allowed = {"overlay", "patterns", "message_start", "decimal_separator", "min_kg", "max_kg", "confidence", "parser_verified", "best_effort", "region", "registered_players", "name_corrections", "rules"}
+    allowed = {"overlay", "patterns", "pattern_presets", "message_start", "decimal_separator", "min_kg", "max_kg", "confidence", "parser_verified", "best_effort", "region", "registered_players", "name_corrections", "rules"}
     if set(update) - allowed:
         raise ValueError("Unsupported setting")
     result = current | update
@@ -1206,8 +1233,23 @@ def validate_config(update, current):
     if not isinstance(result["patterns"], list) or not 1 <= len(result["patterns"]) <= 12:
         raise ValueError("Provide 1–12 regex patterns")
     for pattern in result["patterns"]:
-        if len(pattern) > 2000 or not {"username", "fish", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
+        if not isinstance(pattern, str) or len(pattern) > 2000 or not {"username", "fish", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
             raise ValueError("Pattern needs named username, fish, rarity, weight groups")
+    presets = result.get("pattern_presets", [])
+    if not isinstance(presets, list) or len(presets) > 50:
+        raise ValueError("Provide at most 50 named patterns")
+    names = set()
+    for entry in presets:
+        if not isinstance(entry, dict) or set(entry) != {"name", "pattern"}:
+            raise ValueError("Each named pattern needs a name and regex expression")
+        name, pattern = entry["name"], entry["pattern"]
+        if not isinstance(name, str) or not name.strip() or len(name) > 80:
+            raise ValueError("Pattern names must contain 1-80 characters")
+        if name.strip().casefold() in names:
+            raise ValueError("Pattern names must be unique")
+        names.add(name.strip().casefold())
+        if not isinstance(pattern, str) or len(pattern) > 2000 or not {"username", "fish", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
+            raise ValueError("Named patterns need valid regexes with username, fish, rarity, weight groups")
     re.compile(result["message_start"])
     if not 0 <= float(result["confidence"]) <= 1:
         raise ValueError("Confidence must be 0–1")
@@ -1800,6 +1842,43 @@ def self_test(directory=None):
     import unittest
 
     class Tests(unittest.TestCase):
+        def test_named_pattern_library(self):
+            import tempfile
+            with tempfile.TemporaryDirectory(dir=directory) as folder:
+                config = Config(folder)
+                settings = config.snapshot()
+                self.assertEqual(settings["pattern_presets"][:3], NAMED_PATTERNS)
+                update = {"patterns": [ALL_RARITIES_PATTERN], "pattern_presets": NAMED_PATTERNS[:2]}
+                validate_config(update, settings)
+                config.update(update)
+                self.assertEqual(Config(folder).snapshot()["pattern_presets"], NAMED_PATTERNS[:2])
+                edited = [{"name": "My common catches", "pattern": COMMON_FISH_PATTERN}]
+                update = {"patterns": [COMMON_FISH_PATTERN], "pattern_presets": edited}
+                validate_config(update, settings)
+                config.update(update)
+                self.assertEqual(Config(folder).snapshot()["pattern_presets"], edited)
+                for entries in ([{"name": "", "pattern": COMMON_FISH_PATTERN}],
+                                [NAMED_PATTERNS[0], NAMED_PATTERNS[0]],
+                                [{"name": "Broken", "pattern": "("}],
+                                [{"name": "Missing groups", "pattern": "fish"}]):
+                    with self.assertRaises((ValueError, re.error)):
+                        validate_config({"pattern_presets": entries}, settings)
+
+        def test_named_pattern_rarities_and_overlap(self):
+            settings = self.settings | {"message_start": FISCH_START, "best_effort": True}
+            for rarity in ("Common", "Limited", "Rare"):
+                text = f"[System] Player123 has perfectly caught a {rarity} 1.2kg Trout!"
+                for entry in NAMED_PATTERNS:
+                    match = re.fullmatch(entry["pattern"], text)
+                    self.assertEqual(bool(match), entry["name"] == "All Rarities" or entry["name"] == rarity + " Fish")
+                parsed = parse_catch(text, 1, 1, settings | {"patterns": [p["pattern"] for p in NAMED_PATTERNS]})
+                self.assertEqual(parsed["status"], "confirmed", parsed)
+                self.assertEqual(parsed["rarity"], rarity)
+            conflicting = ALL_RARITIES_PATTERN.replace("(?P<fish>.+?)", "(?P<fish>.+?)[t]")
+            parsed = parse_catch("[System] Player123 has caught a Common 1.2kg Trout!", 1, 1,
+                                 settings | {"patterns": [ALL_RARITIES_PATTERN, conflicting]})
+            self.assertEqual(parsed["reason"], "Ambiguous parser matches")
+
         def setUp(self):
             self.tmp = tempfile.TemporaryDirectory(dir=directory)
             self.config = Config(self.tmp.name)
