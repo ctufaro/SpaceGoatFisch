@@ -1184,9 +1184,8 @@ const source=new EventSource('/stream');source.addEventListener('state',e=>{rend
 ADMIN_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SpaceGoat Admin</title><style>__STYLE__
 body{background:#071721;padding:18px;max-width:1400px;margin:auto;font-size:14px}
 h1{font-size:25px}h2{font-size:18px;margin:0 0 10px}p{margin:8px 0;line-height:1.45}a{color:#80e9d0}
-#private{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:start}
-#private>.panel{margin:0;min-width:0;padding:14px;border-radius:10px}
-#private>.tournament-panel,#private>.feed-panel{grid-column:1/-1}
+#private{display:flex;flex-direction:column;gap:14px}
+#private>.panel{margin:0;min-width:0;width:100%;padding:14px;border-radius:10px}
 .grid,.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin:10px 0}
 .grid>*,.actions>*{min-width:0}.grid label{flex:0 1 190px;max-width:100%}
 .grid label:has(input[type=radio]),.grid label:has(input[type=checkbox]){flex:0 0 auto;flex-direction:row;align-items:center;align-self:center;gap:7px}
@@ -1206,7 +1205,7 @@ th{position:sticky;top:0;background:#112735;z-index:1}td{overflow-wrap:anywhere}
 .cell-content{max-height:115px;overflow:auto;white-space:pre-wrap;max-width:430px}td:nth-child(2) .cell-content{min-width:130px}
 .preview-scroll{max-height:340px;overflow:auto}#regionCanvas{margin:8px 0!important}
 #stats,#patternStatus{display:block;margin-top:8px}#timer{margin:10px 0}
-@media(max-width:850px){#private{grid-template-columns:minmax(0,1fr)}body{padding:10px}.grid label{flex:1 1 150px}}
+@media(max-width:850px){body{padding:10px}.grid label{flex:1 1 150px}}
 </style></head><body>
 <h1>SpaceGoat Tournament Control</h1><p class="muted">Corrections are audited. Review events contribute zero until confirmed.</p>
 <div class="panel"><span id="auth">Connected</span></div><div id="error" class="error"></div>
