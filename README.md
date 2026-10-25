@@ -16,6 +16,16 @@ Run offline after setup: `Update-And-Run.bat -SkipUpdate`.
 
 Settings, evidence, and tournament history stay on each laptop in `%LOCALAPPDATA%\SpaceGoatFisch`. Git does not synchronize this data. The existing development launcher uses the separate private `spacegoat-dev-data` folder.
 
+## Tournament controls
+
+In the admin dashboard, enter the tournament title, choose **Total weight** or **Fish caught**, and click **Save tournament settings**. Rankings recalculate from recorded qualifying catches. The OBS overlay displays kilograms or fish counts to match. Enter a custom footer, or leave it blank for the automatic winning rule.
+
+**Qualifying catches** selects the regex pattern used in both scoring modes. In count mode each confirmed matching announcement adds one catch; an unreadable numeric weight does not prevent counting if the announcement still matches the selected regex. A regex that requires a weight token still requires that token to be present.
+
+Under **Player name corrections**, choose the encountered name to merge and its destination, then click **Merge names**. Both dropdowns use names observed in the current tournament, including review events. Existing scores merge and future catches use the destination name. Creating or resetting a tournament clears its active name list and corrections; archived catch history remains available.
+
+Manual catch editing, overlay settings, and parser calibration are collapsed until needed. Pattern selection stays visible.
+
 ## Validation and packaging
 
 - `Update-And-Run.bat -SelfTest`: scoring and lifecycle tests.

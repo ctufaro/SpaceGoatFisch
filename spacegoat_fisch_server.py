@@ -44,11 +44,14 @@ FISCH_PATTERN = r"^\[\s*System\s*\]\s*(?P<username>[A-Za-z0-9_]{3,20}?)\s*has\s*
 FISCH_START = r"^\s*\[\s*System\s*\]"
 COMMON_FISH_PATTERN = r'''^\[\s*System\s*\]\s*(?:[A-Za-z]\s+)?(?P<username>[A-Za-z0-9_]{3,20}?)(?:\s+[A-Za-z|])?\s*has\s*(?:s\s+)?(?:perfectly\s*)?caught\s*(?:t\s*)?an?\s*[(:'";’]*\s*(?P<rarity>Common)\s*[(:'";’]*\s*(?:[A-Za-z&|]\s+)?(?:\d{1,2}\s+(?=(?:\d{1,2}|\d{4,})\.\d+\s*kg))?(?P<weight>[\d.,\s]+)\s*kg\s*(?P<fish>.+?)\s*[!.]+$'''
 ALL_RARITIES_PATTERN = r'''^\[\s*System\s*\]\s*(?:[A-Za-z]\s+)?(?P<username>[A-Za-z0-9_]{3,20}?)\s*(?:[I|hl]\s+)?has\s*(?:s\s+)?(?:perfectly\s*)?caught\s*(?:t\s+)?an?\s*[(:'";’]*\s*(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)\s*[(:'";’]*\s*(?:\d{1,2}\s+(?=(?:\d{1,2}|\d{4,})\.\d+\s*kg))?(?P<weight>[\d.,\s]+)\s*kg\s*(?P<fish>.+?)\s*[!.]+$'''
+PREVIOUS_LIMITED_PATTERN = ALL_RARITIES_PATTERN.replace(
+    "(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)", "(?P<rarity>Limited)")
+# A Limited catch needs its owner and weight; a cropped fish suffix is optional.
+LIMITED_PATTERN = r'''^(?:\[\s*System\s*\]\s*)?(?!(?:caught|has|perfectly|an?|Limited)\b)(?P<username>[A-Za-z0-9_]{3,20})\s+(?:(?:has|perfectly|caught|an?|s|t)\s+)*[(:'";’]*\s*(?P<rarity>Limited)\b\s*[(:'";’]*\s*(?P<weight>[\dIl|.,\s]+)\s*kg\b(?:\s+(?P<fish>.*?))?\s*[!.]*$'''
 NAMED_PATTERNS = [
     {"name": "Common Fish", "pattern": COMMON_FISH_PATTERN},
     {"name": "All Rarities", "pattern": ALL_RARITIES_PATTERN},
-    {"name": "Limited Fish", "pattern": ALL_RARITIES_PATTERN.replace(
-        "(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)", "(?P<rarity>Limited)")},
+    {"name": "Limited Fish", "pattern": LIMITED_PATTERN},
 ]
 DEFAULTS = {
     "region": None, "host": "", "port": 8765, "fps": 12,
@@ -92,6 +95,12 @@ class Config:
                 if not backup.exists():
                     backup.write_text(previous_text, encoding="utf-8")
                 self.values["patterns"] = [FISCH_PATTERN]
+        # Upgrade only the exact shipped Limited regex, preserving custom edits.
+        self.values["patterns"] = [LIMITED_PATTERN if p == PREVIOUS_LIMITED_PATTERN else p
+                                   for p in self.values["patterns"]]
+        for entry in self.values.get("pattern_presets", []):
+            if entry.get("pattern") == PREVIOUS_LIMITED_PATTERN:
+                entry["pattern"] = LIMITED_PATTERN
         # Discard credentials left by older versions.
         self.values.pop("admin_token", None)
         if "pattern_presets" not in self.values:
@@ -233,6 +242,13 @@ def parse_catch(raw, confidence, visual_confidence, settings):
             result["reason"] = "Ambiguous parser matches"
         return result
     fields = matches[0]
+    fields["fish"] = (fields.get("fish") or "").strip()
+    if fields.get("rarity", "").lower() == "limited":
+        fields["fish"] = fields["fish"].rstrip("!.").strip() or "Unknown fish"
+        if settings.get("best_effort", False) and re.search(r"\d", fields.get("weight", "")):
+            # Confine OCR 1/l/I/| repairs to the extracted Limited weight.
+            fields["weight"] = fields["weight"].translate(str.maketrans({"l": "1", "L": "1", "i": "1", "I": "1", "|": "1"}))
+    canonical = canonical or resolve_correction(fields.get("username", ""), corrections)
     if canonical:
         fields["username"] = canonical
     try:
@@ -242,14 +258,17 @@ def parse_catch(raw, confidence, visual_confidence, settings):
             raise ValueError("Missing fish or rarity")
         result.update({k: fields[k].strip() for k in ("username", "fish", "rarity")})
         try:
-            result["weight_units"] = parse_weight(fields["weight"], settings)
+            result["weight_units"] = parse_weight(fields.get("weight") or "", settings)
         except ValueError:
             # Only best-effort mode drops short detached OCR tokens before a complete
             # decimal weight. Valid thousands grouping is always preserved above.
-            weight = re.fullmatch(r"(?:[0-9]{1,2}\s+)+([0-9]+[.,][0-9]+)", fields["weight"].strip())
-            if not settings.get("best_effort", False) or not weight:
+            weight = re.fullmatch(r"(?:[0-9]{1,2}\s+)+([0-9]+[.,][0-9]+)", (fields.get("weight") or "").strip())
+            if settings.get("scoring_mode") == "count":
+                result["weight_units"] = 0
+            elif not settings.get("best_effort", False) or not weight:
                 raise
-            result["weight_units"] = parse_weight(weight[1], settings)
+            else:
+                result["weight_units"] = parse_weight(weight[1], settings)
         if settings.get("best_effort", False):
             result.update(status="confirmed", reason="Best-effort live score")
         elif not settings["parser_verified"]:
@@ -283,6 +302,10 @@ class Store:
               raw_text TEXT NOT NULL, confidence REAL NOT NULL,
               visual_confidence REAL NOT NULL, status TEXT NOT NULL,
               reason TEXT NOT NULL, evidence TEXT);
+            CREATE TABLE IF NOT EXISTS observed_names(
+              tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+              username TEXT NOT NULL COLLATE NOCASE,
+              PRIMARY KEY(tournament_id,username));
             CREATE TABLE IF NOT EXISTS kicked_players(
               tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
               username TEXT NOT NULL COLLATE NOCASE,
@@ -293,7 +316,7 @@ class Store:
               action TEXT NOT NULL, event_id INTEGER, before_json TEXT, after_json TEXT);
             """)
             columns = {r[1] for r in db.execute("PRAGMA table_info(tournaments)")}
-            for column, definition in (("scheduled_start", "REAL"), ("started_at", "REAL"), ("elapsed_seconds", "REAL NOT NULL DEFAULT 0")):
+            for column, definition in (("scoring_mode", "TEXT NOT NULL DEFAULT 'weight'"), ("tagline", "TEXT NOT NULL DEFAULT ''"), ("scheduled_start", "REAL"), ("started_at", "REAL"), ("elapsed_seconds", "REAL NOT NULL DEFAULT 0")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE tournaments ADD COLUMN {column} {definition}")
             if db.execute("SELECT value FROM metadata WHERE key='active'").fetchone() is None:
@@ -331,6 +354,20 @@ class Store:
         db.execute("INSERT OR REPLACE INTO metadata VALUES('active',?)", (str(cursor.lastrowid),))
         self._audit(db, "admin", "create", after={"id": cursor.lastrowid, "name": name})
         return cursor.lastrowid
+
+    def settings(self, name, scoring_mode, tagline):
+        if not isinstance(name, str) or not name.strip() or len(name) > 120:
+            raise ValueError("Tournament title needs 1-120 characters")
+        if scoring_mode not in ("weight", "count"):
+            raise ValueError("Choose weight or count scoring")
+        if not isinstance(tagline, str) or len(tagline) > 200:
+            raise ValueError("Footer needs at most 200 characters")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = self._active(db)
+            db.execute("UPDATE tournaments SET name=?,scoring_mode=?,tagline=? WHERE id=?",
+                       (name.strip(), scoring_mode, tagline, active["id"]))
+            self._audit(db, "admin", "settings", before=active, after=self._active(db))
 
     def transition(self, action, name="Fisch Weight Championship", countdown_seconds=None):
         with self.connection() as db:
@@ -373,13 +410,20 @@ class Store:
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             fields = dict(fields)
+            names = [fields.get("username", "")]
+            header = re.match(r"^\[\s*System\s*\]\s*(.*?)\s*has\b", fields.get("raw_text", ""), re.IGNORECASE)
+            if header:
+                names.append(header[1].strip())
+            for label in names:
+                if re.fullmatch(r"[A-Za-z0-9_ ]{3,64}", label):
+                    db.execute("INSERT OR IGNORE INTO observed_names VALUES(?,?)", (tournament_id, label))
             if db.execute("SELECT 1 FROM kicked_players WHERE tournament_id=? AND username=?", (tournament_id,fields["username"])).fetchone():
                 fields.update(status="disqualified",reason="Kicked from scoreboard")
             # The capture assigns the session at acquisition, never at OCR completion.
             keys = ("username", "fish", "rarity", "weight_units", "raw_text", "confidence", "visual_confidence", "status", "reason")
             # Suppress rapid re-reads, including minor fish-text OCR variations.
             # Equal catches outside this short window remain separate events.
-            if actor == "ocr" and fields.get("reason") == "Best-effort live score":
+            if actor == "ocr" and fields.get("reason") == "Best-effort live score" and fields["weight_units"] > 0:
                 duplicate = db.execute("""SELECT id FROM events WHERE tournament_id=?
                     AND status='confirmed' AND username=? COLLATE NOCASE
                     AND rarity=? COLLATE NOCASE AND weight_units=?
@@ -411,7 +455,7 @@ class Store:
                     if key in changes:
                         after[key] = str(changes[key]).strip()[:500]
                 if "weight_kg" in changes:
-                    after["weight_units"] = parse_weight(str(changes["weight_kg"]), settings)
+                    after["weight_units"] = 0 if settings.get("scoring_mode") == "count" and str(changes["weight_kg"]).strip() in ("", "0", "0.0") else parse_weight(str(changes["weight_kg"]), settings)
                 if after["status"] not in ("confirmed", "review", "disqualified"):
                     raise ValueError("Invalid status")
                 if after["status"] == "confirmed":
@@ -467,18 +511,21 @@ class Store:
             rows = db.execute("""SELECT username,SUM(weight_units) total,COUNT(*) catches,
                 MAX(weight_units) largest FROM events WHERE tournament_id=? AND status='confirmed'
                 GROUP BY username COLLATE NOCASE ORDER BY total DESC,username COLLATE NOCASE""", (active["id"],)).fetchall()
+            rows = sorted(rows, key=lambda row: (-row["catches"] if active["scoring_mode"] == "count" else -row["total"], row["username"].lower()))
             leaderboard = []
             previous, rank = None, 0
             for i, row in enumerate(rows, 1):
-                if row["total"] != previous:
+                score = row["catches"] if active["scoring_mode"] == "count" else row["total"]
+                if score != previous:
                     rank = i
-                previous = row["total"]
+                previous = score
                 leaderboard.append({"rank": rank, "username": row["username"], "total_kg": row["total"] / 1000000,
                                     "catches": row["catches"], "largest_kg": row["largest"] / 1000000,
                                     "average_kg": row["total"] / row["catches"] / 1000000})
             counts = dict(db.execute("SELECT status,COUNT(*) FROM events WHERE tournament_id=? GROUP BY status", (active["id"],)).fetchall())
             last = db.execute("SELECT * FROM events WHERE tournament_id=? AND status='confirmed' ORDER BY id DESC LIMIT 1", (active["id"],)).fetchone()
-            return {"tournament": active, "leaderboard": leaderboard, "counts": counts,
+            names = [r[0] for r in db.execute("SELECT username FROM observed_names WHERE tournament_id=? UNION SELECT username FROM events WHERE tournament_id=? AND username!='' ORDER BY username COLLATE NOCASE", (active["id"], active["id"]))]
+            return {"encountered_names": names, "tournament": active, "leaderboard": leaderboard, "counts": counts,
                     "recent": self.event_json(last) if last else None,
                     "kicked_players": [r[0] for r in db.execute("SELECT username FROM kicked_players WHERE tournament_id=? ORDER BY username",(active["id"],))]}
 
@@ -509,6 +556,8 @@ def validate_manual(fields, settings):
         raise ValueError("Username must have 3–20 letters, digits, or underscores")
     if not fields["fish"] or not fields["rarity"]:
         raise ValueError("Fish and rarity required")
+    if settings.get("scoring_mode") == "count" and fields["weight_units"] == 0:
+        return
     if not Decimal(settings["min_kg"]) * 1000000 <= fields["weight_units"] <= Decimal(settings["max_kg"]) * 1000000:
         raise ValueError("Weight outside plausibility limits")
 
@@ -848,6 +897,8 @@ class Runtime:
                 self.start_monitoring()
             # A monotonic epoch tags frames. Changes invalidate old visual baselines.
             self.store.transition(action, name, countdown_seconds)
+            if action in ("reset", "create"):
+                self.config.update({"name_corrections": {}, "registered_players": []})
             self.session_epoch += 1
             self.changed()
 
@@ -982,7 +1033,7 @@ class Runtime:
                         self.warn(f"Periodic OCR preview failed: {exc}")
                 continue
             image, visual, identity, session, stamp = item
-            settings = self.config.snapshot()
+            settings = self.config.snapshot() | {"scoring_mode": self.store.active()["scoring_mode"]}
             evidence = None
             try:
                 evidence = self.save_evidence(image, identity, force=visual < .9)
@@ -1017,7 +1068,7 @@ class Runtime:
                     parsed = parse_catch(piece["text"], piece["confidence"], piece["visual"], settings)
                     if parsed["status"] == "review" and not piece["evidence"]:
                         piece["evidence"] = self.save_evidence(image, identity, force=True)
-                    if parsed["weight_units"] > 0 or index < len(groups)-1:
+                    if parsed["status"] == "confirmed" or parsed["weight_units"] > 0 or index < len(groups)-1:
                         self.persist_ocr(piece)
                     else:
                         pending = piece
@@ -1038,7 +1089,8 @@ class Runtime:
         with self.control_lock:
             if self.cancel_work.is_set():
                 return
-            fields = parse_catch(piece["text"], piece["confidence"], piece["visual"], self.config.snapshot())
+            settings = self.config.snapshot() | {"scoring_mode": self.store.active()["scoring_mode"]}
+            fields = parse_catch(piece["text"], piece["confidence"], piece["visual"], settings)
             self.store.insert(fields, piece["identity"], piece["session"], piece["stamp"], piece.get("evidence"))
             self.changed()
 
@@ -1106,17 +1158,17 @@ header{padding:22px;background:linear-gradient(120deg,#10495c,#116555);border-bo
 .first{color:#ffdb7d;background:#eec23b12}.second{color:#d8ebf5}.third{color:#e9b185}footer{padding:12px 22px;font-size:12px;letter-spacing:2px;color:#aee5dc}#recent{padding:12px 22px;border-top:1px solid #64ceb330;font-size:14px}#connection{font-size:11px;color:#ffa885;letter-spacing:1px}
 .vertical{width:380px}.vertical h1{font-size:19px}.vertical .name{font-size:16px}.vertical .weight{font-size:18px}.vertical .row{gap:8px;padding:10px 0}
 __FISCH_STYLE__
-</style></head><body><section class="board" id="board"><header><div class="eyebrow">SPACEGOAT • LIVE FROM FISCH</div><h1 id="title">FISCH WEIGHT CHAMPIONSHIP</h1><div id="timer" style="font-size:22px;font-weight:700;margin:10px 0;font-variant-numeric:tabular-nums"></div><div id="rules"></div></header><div id="rows"></div><div id="recent"></div><footer><span id="connection">Connecting?</span> MOST WEIGHT WINS! <span id="status"></span><div id="accuracy" style="margin-top:8px;letter-spacing:0">Experimental scores - not 100% accurate; still working on it.</div></footer></section><script>
+</style></head><body><section class="board" id="board"><header><div class="eyebrow">SPACEGOAT • LIVE FROM FISCH</div><h1 id="title">FISCH WEIGHT CHAMPIONSHIP</h1><div id="timer" style="font-size:22px;font-weight:700;margin:10px 0;font-variant-numeric:tabular-nums"></div><div id="rules"></div></header><div id="rows"></div><div id="recent"></div><footer><span id="connection">Connecting?</span> <span id="tagline"></span> <span id="status"></span><div id="accuracy" style="margin-top:8px;letter-spacing:0">Experimental scores - not 100% accurate; still working on it.</div></footer></section><script>
 const $=id=>document.getElementById(id), fmt=x=>Number(x).toLocaleString(undefined,{maximumFractionDigits:2});
 let connected=false,lastState=null,lastUpdate=0,refreshing=false;const params=new URLSearchParams(location.search);
 let timerState=null,timerReceived=0;
 function render(s){timerState=s;timerReceived=performance.now();updateTimer();lastState=s;try{localStorage.setItem('spacegoat-last',JSON.stringify(s))}catch(e){}
-$('accuracy').hidden=!s.best_effort;$('rules').textContent=s.rules||'';const o=s.overlay, board=$('board');board.classList.toggle('vertical',params.get('layout')==='vertical'||o.vertical);
+$('tagline').textContent=s.tournament.tagline||(s.tournament.scoring_mode==='count'?'MOST FISH WINS!':'MOST WEIGHT WINS!');$('accuracy').hidden=!s.best_effort;$('rules').textContent=s.rules||'';const o=s.overlay, board=$('board');board.classList.toggle('vertical',params.get('layout')==='vertical'||o.vertical);
 board.style.setProperty('--fisch-panel','rgba(8,9,15,'+o.opacity+')');board.style.transform='scale('+o.scale+')';board.style.background='rgba(5,25,36,'+o.opacity+')';$('title').textContent=s.tournament.name.toUpperCase();$('status').textContent='• '+s.tournament.status.toUpperCase();
 const existing=new Map([...$('rows').children].map(el=>[el.dataset.user,el]));
 if(!existing.size)$('rows').replaceChildren();
 for(const p of s.leaderboard.slice(0,o.players)){let el=existing.get(p.username);if(!el){el=document.createElement('div');el.innerHTML='<div class="rank"></div><div class="name"></div><div class="weight"></div>';el.dataset.user=p.username}
-el.className='row '+({1:'first',2:'second',3:'third'}[p.rank]||'');el.children[0].textContent='#'+p.rank;el.children[1].textContent=p.username;el.children[2].textContent=fmt(p.total_kg)+' kg';$('rows').append(el);existing.delete(p.username)}for(const el of existing.values())el.remove();
+el.className='row '+({1:'first',2:'second',3:'third'}[p.rank]||'');el.children[0].textContent='#'+p.rank;el.children[1].textContent=p.username;el.children[2].textContent=s.tournament.scoring_mode==='count'?fmt(p.catches)+' fish':fmt(p.total_kg)+' kg';$('rows').append(el);existing.delete(p.username)}for(const el of existing.values())el.remove();
 if(!s.leaderboard.length)$('rows').textContent='Waiting for confirmed catches…';
 $('recent').hidden=!o.recent;$('recent').textContent=s.recent?'LATEST • '+s.recent.username+' • '+s.recent.fish+' • '+fmt(s.recent.weight_kg)+' kg':'';}
 function updateTimer(){if(!timerState)return;const t=timerState.tournament,now=timerState.server_time+(performance.now()-timerReceived)/1000;const fmtTime=x=>{x=Math.max(0,Math.floor(x));return (x>=3600?Math.floor(x/3600)+':':'')+String(Math.floor(x/60)%60).padStart(2,'0')+':'+String(x%60).padStart(2,'0')};let text='Ready to start';if(t.status==='ready'&&t.scheduled_start!=null)text='STARTS IN '+fmtTime(Math.ceil(t.scheduled_start-now));else if(t.status!=='ready'){const elapsed=(t.elapsed_seconds||0)+(t.status==='running'&&t.started_at!=null?Math.max(0,now-t.started_at):0);text=(t.status==='paused'?'PAUSED ':t.status==='finished'?'FINAL TIME ':'ELAPSED ')+fmtTime(elapsed)}$('timer').textContent=text}
@@ -1132,12 +1184,12 @@ const source=new EventSource('/stream');source.addEventListener('state',e=>{rend
 ADMIN_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SpaceGoat Admin</title><style>__STYLE__ body{background:#071721;padding:22px;max-width:1400px;margin:auto}textarea{width:100%;min-height:80px}input{max-width:240px}pre{white-space:pre-wrap}a{color:#80e9d0}</style></head><body>
 <h1>SpaceGoat Tournament Control</h1><p class="muted">Corrections are audited. Review events contribute zero until confirmed.</p>
 <div class="panel"><span id="auth">Connected</span></div><div id="error" class="error"></div>
-<div id="private"><div class="panel"><h2 id="title"></h2><div class="grid"><input id="sessionName" placeholder="New tournament name"><button data-action="create">Create</button><button data-action="start">Start now</button><button data-action="pause">Pause</button><button data-action="resume">Resume</button><button data-action="finish">Finish</button><button data-action="reset">Reset into new session</button><button id="export">Export CSV</button></div><div class="grid" style="margin-top:12px"><label>Start countdown (seconds)<input id="countdownSeconds" type="number" min="1" max="86400" value="60"></label><button id="scheduleStart">Start with countdown</button><button data-action="cancel_countdown">Cancel countdown</button></div><p id="timer" style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums"></p><p class="muted">Create a tournament, then start now or use a countdown. Pause freezes scoring and the elapsed clock; Resume continues both. Finish keeps the final scores. Capture starts automatically when you start or schedule the tournament.</p><div id="stats"></div><table><thead><tr><th>Rank</th><th>Player</th><th>Total kg</th><th>Catches</th><th>Largest</th><th>Average</th><th>Actions</th></tr></thead><tbody id="leaders"></tbody></table></div>
-<div class="panel"><h2>Player name corrections</h2><p class="muted">Everyone joins automatically when a readable catch appears. Add corrections only when needed: wrongName-&gt;correctUsername, one per line. Saving merges matching scores in the current tournament and corrects future catches. No registration is required.</p><textarea id="roster" placeholder="FifthSparkGMZZ-&gt;FifthSparkGMZ"></textarea><button id="rosterSave">Save corrections</button><div class="grid" style="margin-top:12px"><label>Incorrect name<input id="correctionSource" placeholder="FifthSparkGMZZ"></label><label>Correct username<input id="correctionTarget" list="playerNames" placeholder="FifthSparkGMZ"></label><datalist id="playerNames"></datalist><button id="addCorrection">Add and save correction</button></div><p id="correctionNotice"></p><p id="kickedPlayers"></p></div><div class="panel"><h2>Overlay rules</h2><label>Rules shown below the timer<textarea id="rulesText" maxlength="2000" placeholder="Common fish only. Highest total weight wins."></textarea></label><button id="rulesSave">Save rules</button></div><div class="panel"><h2>Capture / OCR</h2><p id="captureStatus"></p><div class="grid"><button data-monitor="start">Start capture</button><button data-monitor="stop">Stop capture</button><button data-monitor="restart">Restart capture</button><button data-monitor="preview">Test OCR</button></div><p class="muted">Start now, Resume, and Start with countdown start capture automatically. Keep the game chat visible and unobstructed; place this dashboard on another monitor when possible.</p><details><summary>Chat region setup</summary><p>Select a monitor, load its screenshot, then drag around the catch messages. Click Save chat region. Stop capture before changing the region.</p><div class="grid"><select id="captureMonitor"></select><button id="loadScreen">Load monitor screenshot</button></div><canvas id="regionCanvas" style="display:none;width:100%;max-width:900px;touch-action:none;cursor:crosshair;margin:12px 0"></canvas><div class="grid"><label>Left<input id="regionLeft" type="number"></label><label>Top<input id="regionTop" type="number"></label><label>Width<input id="regionWidth" type="number" min="60"></label><label>Height<input id="regionHeight" type="number" min="30"></label><button id="saveRegion">Save chat region</button></div><p id="regionNotice"></p></details><details><summary>Detailed capture health</summary><pre id="health"></pre></details><details><summary>OCR preview</summary><pre id="preview"></pre></details></div>
-<div class="panel"><h2>Add or correct a catch</h2><div class="grid"><label>Event ID (blank = add)<input id="eventId" readonly></label><label>Username<input id="username"></label><label>Fish<input id="fish"></label><label>Rarity<input id="rarity"></label><label>Weight kg<input id="weight"></label><label>Status<select id="eventStatus"><option>confirmed</option><option>review</option><option>disqualified</option></select></label><label>Reason<input id="reason"></label></div><p><button id="save">Save catch</button> <button id="clear">Clear form</button></p><pre id="evidence"></pre></div>
+<div id="private"><div class="panel"><h2 id="title"></h2><div class="grid"><label>Tournament title<input id="sessionName" maxlength="120" placeholder="Tournament title"></label><label><input type="radio" name="scoringMode" id="modeWeight" value="weight" checked> Total weight</label><label><input type="radio" name="scoringMode" id="modeCount" value="count"> Fish caught</label><label>Footer<input id="footerText" maxlength="200" placeholder="Automatic winning rule"></label><button id="saveTournament">Save tournament settings</button><button data-action="create">Create</button><button data-action="start">Start now</button><button data-action="pause">Pause</button><button data-action="resume">Resume</button><button data-action="finish">Finish</button><button data-action="reset">Reset into new session</button><button id="export">Export CSV</button></div><div class="grid" style="margin-top:12px"><label>Start countdown (seconds)<input id="countdownSeconds" type="number" min="1" max="86400" value="60"></label><button id="scheduleStart">Start with countdown</button><button data-action="cancel_countdown">Cancel countdown</button></div><p id="timer" style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums"></p><p class="muted">Create a tournament, then start now or use a countdown. Pause freezes scoring and the elapsed clock; Resume continues both. Finish keeps the final scores. Capture starts automatically when you start or schedule the tournament.</p><div id="stats"></div><table><thead><tr><th>Rank</th><th>Player</th><th>Total kg</th><th>Catches</th><th>Largest</th><th>Average</th><th>Actions</th></tr></thead><tbody id="leaders"></tbody></table></div>
+<div class="panel"><h2>Qualifying catches</h2><p class="muted">The selected pattern chooses which catches qualify in both scoring modes.</p><label for="patternSelect">Pattern</label><div class="grid" style="align-items:center"><select id="patternSelect" aria-label="Active pattern"></select><button id="editPattern" type="button">Edit</button><button id="deletePattern" type="button">Delete</button><button id="addPattern" type="button">Add pattern</button></div><span id="patternStatus" role="status"></span></div><div class="panel"><h2>Player name corrections</h2><p class="muted">Select an encountered name and merge it into another name. Past scores and future catches are combined. Names and corrections reset for each new tournament.</p><details><summary>Existing corrections</summary><textarea id="roster" readonly></textarea><button id="rosterSave" hidden>Save corrections</button></details><div class="grid"><label>Merge this name<select id="correctionSource"></select></label><label>Into this name<select id="correctionTarget"></select></label><datalist id="playerNames"></datalist><button id="addCorrection">Merge names</button></div><p id="correctionNotice"></p><p id="kickedPlayers"></p></div><div class="panel"><h2>Overlay rules</h2><label>Rules shown below the timer<textarea id="rulesText" maxlength="2000" placeholder="Common fish only. Highest total weight wins."></textarea></label><button id="rulesSave">Save rules</button></div><div class="panel"><h2>Capture / OCR</h2><p id="captureStatus"></p><div class="grid"><button data-monitor="start">Start capture</button><button data-monitor="stop">Stop capture</button><button data-monitor="restart">Restart capture</button><button data-monitor="preview">Test OCR</button></div><p class="muted">Start now, Resume, and Start with countdown start capture automatically. Keep the game chat visible and unobstructed; place this dashboard on another monitor when possible.</p><details><summary>Chat region setup</summary><p>Select a monitor, load its screenshot, then drag around the catch messages. Click Save chat region. Stop capture before changing the region.</p><div class="grid"><select id="captureMonitor"></select><button id="loadScreen">Load monitor screenshot</button></div><canvas id="regionCanvas" style="display:none;width:100%;max-width:900px;touch-action:none;cursor:crosshair;margin:12px 0"></canvas><div class="grid"><label>Left<input id="regionLeft" type="number"></label><label>Top<input id="regionTop" type="number"></label><label>Width<input id="regionWidth" type="number" min="60"></label><label>Height<input id="regionHeight" type="number" min="30"></label><button id="saveRegion">Save chat region</button></div><p id="regionNotice"></p></details><details><summary>Detailed capture health</summary><pre id="health"></pre></details><details><summary>OCR preview</summary><pre id="preview"></pre></details></div>
+<details class="panel"><summary>Add or correct a catch</summary><div class="grid"><label>Event ID (blank = add)<input id="eventId" readonly></label><label>Username<input id="username"></label><label>Fish<input id="fish"></label><label>Rarity<input id="rarity"></label><label>Weight kg<input id="weight"></label><label>Status<select id="eventStatus"><option>confirmed</option><option>review</option><option>disqualified</option></select></label><label>Reason<input id="reason"></label></div><p><button id="save">Save catch</button> <button id="clear">Clear form</button></p><pre id="evidence"></pre></details>
 <div class="panel"><h2>Catch feed / history</h2><select id="history"></select><button id="previous">Previous</button><button id="next">Next</button><span id="pagination"></span><table><thead><tr><th>ID / time</th><th>Player / fish</th><th>kg</th><th>Confidence</th><th>Status / OCR</th><th>Actions</th></tr></thead><tbody id="events"></tbody></table></div>
-<div class="panel"><h2>Overlay settings</h2><div class="grid"><label>Players<input id="players" type="number" min="1" max="10"></label><label>Scale<input id="scale" type="number" step="0.1" min="0.3" max="3"></label><label>Panel opacity<input id="opacity" type="number" step="0.05" min="0" max="1"></label><label>Vertical<input id="vertical" type="checkbox"></label><label>Recent catches<input id="recent" type="checkbox"></label><button id="overlaySave">Apply overlay</button></div></div>
-<div class="panel"><h2>Parser calibration</h2><p class="muted">The shipped preset matches supplied live-game samples: [System] Player has perfectly caught a Rarity 1.2kg Fish! Modifiers remain in the fish description. Required named groups: username, fish, rarity, weight. Parser changes take effect on future events.</p><label for="patternSelect">Pattern</label><div class="grid" style="align-items:center"><select id="patternSelect" aria-label="Active pattern"></select><button id="editPattern" type="button">Edit</button><button id="deletePattern" type="button">Delete</button><button id="addPattern" type="button">Add pattern</button></div><span id="patternStatus" role="status"></span><div id="patternEditor" hidden><label>Friendly name<input id="patternName" maxlength="80"></label><label>Regex expression<textarea id="patternRegex" maxlength="2000" spellcheck="false"></textarea></label><button id="savePattern" type="button">Save pattern</button><button id="cancelPattern" type="button">Cancel</button></div><label>Message start regex (wrapped-row grouping)<input id="messageStart"></label><div class="grid"><label>Decimal separator<select id="decimal"><option>.</option><option>,</option></select></label><label>Minimum kg<input id="minKg"></label><label>Maximum kg<input id="maxKg"></label><label>Minimum OCR confidence<input id="confidence" type="number" step="0.01" min="0" max="1"></label><label>Best-effort live scoring<input id="bestEffort" type="checkbox"></label><label>Verified with real samples<input id="verified" type="checkbox"></label></div><button id="parserSave">Save parser</button><label>Sample announcement<textarea id="sample"></textarea></label><button id="testParser">Test without recording</button><pre id="parsed"></pre></div></div>
+<details class="panel"><summary>Overlay settings</summary><div class="grid"><label>Players<input id="players" type="number" min="1" max="10"></label><label>Scale<input id="scale" type="number" step="0.1" min="0.3" max="3"></label><label>Panel opacity<input id="opacity" type="number" step="0.05" min="0" max="1"></label><label>Vertical<input id="vertical" type="checkbox"></label><label>Recent catches<input id="recent" type="checkbox"></label><button id="overlaySave">Apply overlay</button></div></details>
+<details class="panel"><summary>Parser calibration</summary><p class="muted">The shipped preset matches supplied live-game samples: [System] Player has perfectly caught a Rarity 1.2kg Fish! Modifiers remain in the fish description. Required named groups: username, rarity, weight. Fish name is optional for Limited catches. Parser changes take effect on future events.</p><div id="patternEditor" hidden><label>Friendly name<input id="patternName" maxlength="80"></label><label>Regex expression<textarea id="patternRegex" maxlength="2000" spellcheck="false"></textarea></label><button id="savePattern" type="button">Save pattern</button><button id="cancelPattern" type="button">Cancel</button></div><label>Message start regex (wrapped-row grouping)<input id="messageStart"></label><div class="grid"><label>Decimal separator<select id="decimal"><option>.</option><option>,</option></select></label><label>Minimum kg<input id="minKg"></label><label>Maximum kg<input id="maxKg"></label><label>Minimum OCR confidence<input id="confidence" type="number" step="0.01" min="0" max="1"></label><label>Best-effort live scoring<input id="bestEffort" type="checkbox"></label><label>Verified with real samples<input id="verified" type="checkbox"></label></div><button id="parserSave">Save parser</button><label>Sample announcement<textarea id="sample"></textarea></label><button id="testParser">Test without recording</button><pre id="parsed"></pre></details></div>
 <script>
 const $=id=>document.getElementById(id);let offset=0,items=[],activeId=null,editing=false,leaderSnapshot='';
 function err(e){$('error').textContent=e.message||String(e)}
@@ -1146,12 +1198,12 @@ function cells(row,values){for(const v of values){const td=document.createElemen
 let timerState=null,timerReceived=0;
 function updateTimer(){if(!timerState)return;const t=timerState.tournament,now=timerState.server_time+(performance.now()-timerReceived)/1000;const fmtTime=x=>{x=Math.max(0,Math.floor(x));return (x>=3600?Math.floor(x/3600)+':':'')+String(Math.floor(x/60)%60).padStart(2,'0')+':'+String(x%60).padStart(2,'0')};let text='Ready to start';if(t.status==='ready'&&t.scheduled_start!=null)text='STARTS IN '+fmtTime(Math.ceil(t.scheduled_start-now));else if(t.status!=='ready'){const elapsed=(t.elapsed_seconds||0)+(t.status==='running'&&t.started_at!=null?Math.max(0,now-t.started_at):0);text=(t.status==='paused'?'PAUSED ':t.status==='finished'?'FINAL TIME ':'ELAPSED ')+fmtTime(elapsed)}$('timer').textContent=text}
 setInterval(updateTimer,100);
-function render(s){timerState=s;timerReceived=performance.now();updateTimer();activeId=s.tournament.id;$('title').textContent=s.tournament.name+' • '+s.tournament.status;$('stats').textContent='Confirmed: '+(s.counts.confirmed||0)+' / Review: '+(s.counts.review||0);const nextLeaders=JSON.stringify([activeId,s.leaderboard]);if(nextLeaders!==leaderSnapshot){leaderSnapshot=nextLeaders;$('leaders').replaceChildren();$('playerNames').replaceChildren();for(const p of s.leaderboard){const option=document.createElement('option');option.value=p.username;$('playerNames').append(option)}for(const p of s.leaderboard){let tr=document.createElement('tr');cells(tr,[p.rank,p.username,p.total_kg.toFixed(3),p.catches,p.largest_kg,p.average_kg.toFixed(3)]);const td=document.createElement('td'),correct=document.createElement('button'),kick=document.createElement('button');correct.textContent='Correct name';correct.onclick=()=>{$('correctionSource').value=p.username;$('correctionTarget').value='';$('correctionTarget').scrollIntoView({behavior:'smooth',block:'center'});$('correctionTarget').focus()};td.append(correct);kick.textContent='Kick';kick.onclick=async()=>{try{await api('/api/players/kick','POST',{username:p.username});render(await api('/api/state'));await feed()}catch(e){err(e)}};td.append(kick);tr.append(td);$('leaders').append(tr)}}$('kickedPlayers').textContent='Kicked this tournament: '+((s.kicked_players||[]).join(', ')||'none');$('captureStatus').textContent=s.health.capture+' | OCR: '+s.health.ocr;$('health').textContent=JSON.stringify({...s.health,preview:undefined},null,2);if(s.health.preview!==undefined)$('preview').textContent=s.health.preview;}
+function render(s){timerState=s;timerReceived=performance.now();updateTimer();if(activeId!==s.tournament.id){$('sessionName').value=s.tournament.name;$('footerText').value=s.tournament.tagline||'';$(s.tournament.scoring_mode==='count'?'modeCount':'modeWeight').checked=true;$('roster').value=''}for(const id of ['correctionSource','correctionTarget']){const select=$(id),selected=select.value;select.replaceChildren(new Option('Select a name',''));for(const name of s.encountered_names||[])select.add(new Option(name,name));select.value=selected}activeId=s.tournament.id;$('title').textContent=s.tournament.name+' • '+s.tournament.status;$('stats').textContent='Confirmed: '+(s.counts.confirmed||0)+' / Review: '+(s.counts.review||0);const nextLeaders=JSON.stringify([activeId,s.leaderboard]);if(nextLeaders!==leaderSnapshot){leaderSnapshot=nextLeaders;$('leaders').replaceChildren();$('playerNames').replaceChildren();for(const p of s.leaderboard){const option=document.createElement('option');option.value=p.username;$('playerNames').append(option)}for(const p of s.leaderboard){let tr=document.createElement('tr');cells(tr,[p.rank,p.username,p.total_kg.toFixed(3),p.catches,p.largest_kg,p.average_kg.toFixed(3)]);const td=document.createElement('td'),correct=document.createElement('button'),kick=document.createElement('button');correct.textContent='Correct name';correct.onclick=()=>{$('correctionSource').value=p.username;$('correctionTarget').value='';$('correctionTarget').scrollIntoView({behavior:'smooth',block:'center'});$('correctionTarget').focus()};td.append(correct);kick.textContent='Kick';kick.onclick=async()=>{try{await api('/api/players/kick','POST',{username:p.username});render(await api('/api/state'));await feed()}catch(e){err(e)}};td.append(kick);tr.append(td);$('leaders').append(tr)}}$('kickedPlayers').textContent='Kicked this tournament: '+((s.kicked_players||[]).join(', ')||'none');$('captureStatus').textContent=s.health.capture+' | OCR: '+s.health.ocr;$('health').textContent=JSON.stringify({...s.health,preview:undefined},null,2);if(s.health.preview!==undefined)$('preview').textContent=s.health.preview;}
 async function feed(){try{$('preview').textContent=(await api('/api/preview')).text;const selected=$('history').value||activeId;const r=await api('/api/events?tournament_id='+selected+'&limit=25&offset='+offset);items=r.items;$('events').replaceChildren();$('pagination').textContent=(offset+1)+'–'+(offset+items.length)+' of '+r.total;
-for(const p of items){let tr=document.createElement('tr');tr.className=p.status;cells(tr,[p.id+' / '+p.timestamp,p.username+' / '+p.fish,p.weight_kg,Math.round(p.confidence*100)+'% OCR / '+Math.round(p.visual_confidence*100)+'% visual',p.status+' • '+p.reason+'\n'+p.raw_text]);let td=document.createElement('td');let edit=document.createElement('button');edit.textContent='Review / edit';edit.onclick=()=>{for(const [id,key] of [['eventId','id'],['username','username'],['fish','fish'],['rarity','rarity'],['weight','weight_kg'],['eventStatus','status'],['reason','reason']])$(id).value=p[key];$('evidence').textContent='Evidence: '+(p.evidence||'not saved');api('/api/audit/'+p.id).then(a=>$('evidence').textContent+='\nAudit: '+JSON.stringify(a,null,2)).catch(err);window.scrollTo({top:$('eventId').getBoundingClientRect().top+window.scrollY-100,behavior:'smooth'})};let del=document.createElement('button');del.textContent='Delete';del.onclick=async()=>{if(confirm('Remove event '+p.id+' from scoring? History is retained.'))try{await api('/api/events/'+p.id,'DELETE',{reason:'Operator deletion'});await feed()}catch(e){err(e)}};td.append(edit,del);tr.append(td);$('events').append(tr)}}catch(e){err(e)}}
+for(const p of items){let tr=document.createElement('tr');tr.className=p.status;cells(tr,[p.id+' / '+p.timestamp,p.username+' / '+p.fish,p.weight_kg,Math.round(p.confidence*100)+'% OCR / '+Math.round(p.visual_confidence*100)+'% visual',p.status+' • '+p.reason+'\n'+p.raw_text]);let td=document.createElement('td');let edit=document.createElement('button');edit.textContent='Review / edit';edit.onclick=()=>{$('eventId').closest('details').open=true;for(const [id,key] of [['eventId','id'],['username','username'],['fish','fish'],['rarity','rarity'],['weight','weight_kg'],['eventStatus','status'],['reason','reason']])$(id).value=p[key];$('evidence').textContent='Evidence: '+(p.evidence||'not saved');api('/api/audit/'+p.id).then(a=>$('evidence').textContent+='\nAudit: '+JSON.stringify(a,null,2)).catch(err);window.scrollTo({top:$('eventId').getBoundingClientRect().top+window.scrollY-100,behavior:'smooth'})};let del=document.createElement('button');del.textContent='Delete';del.onclick=async()=>{if(confirm('Remove event '+p.id+' from scoring? History is retained.'))try{await api('/api/events/'+p.id,'DELETE',{reason:'Operator deletion'});await feed()}catch(e){err(e)}};td.append(edit,del);tr.append(td);$('events').append(tr)}}catch(e){err(e)}}
 async function load(){try{render(await api('/api/state'));const config=await api('/api/config');for(const id of ['players','scale','opacity'])$(id).value=config.overlay[id];for(const id of ['vertical','recent'])$(id).checked=config.overlay[id];await loadPatterns(config);$('messageStart').value=config.message_start;$('decimal').value=config.decimal_separator;$('minKg').value=config.min_kg;$('maxKg').value=config.max_kg;$('confidence').value=config.confidence;$('verified').checked=config.parser_verified;$('bestEffort').checked=config.best_effort;$('rulesText').value=config.rules||'';const mappings={...(config.name_corrections||{})};for(const p of config.registered_players||[])for(const alias of p.aliases||[])if(!(alias in mappings))mappings[alias]=p.username;$('roster').value=Object.entries(mappings).map(([from,to])=>from+'->'+to).join('\n');await loadCapture(config);await history();await feed()}catch(e){err(e)}}
 async function history(){const previous=$('history').value;const sessions=await api('/api/history');$('history').replaceChildren();for(const t of sessions){let o=document.createElement('option');o.value=t.id;o.textContent=t.name+' • '+t.status+' • #'+t.id;$('history').append(o)}$('history').value=previous||activeId}
-for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{if(['reset','create'].includes(b.dataset.action)&&!confirm('Archive current session and create a new one?'))return;await api('/api/tournament','POST',{action:b.dataset.action,name:$('sessionName').value||'Fisch Weight Championship'});render(await api('/api/state'));$('history').value='';offset=0;await history();await feed()}catch(e){err(e)}};
+for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{if(['reset','create'].includes(b.dataset.action)&&!confirm('Archive current session and create a new one?'))return;await api('/api/tournament','POST',{action:b.dataset.action,name:$('sessionName').value||'Fisch Weight Championship'});if(['reset','create'].includes(b.dataset.action))await saveTournament();render(await api('/api/state'));$('history').value='';offset=0;await history();await feed()}catch(e){err(e)}};
 const regionFields=['regionLeft','regionTop','regionWidth','regionHeight'];let monitorList=[],screenImage=null,screenMonitor=null,dragStart=null;
 async function loadCapture(config){if(config.region)regionFields.forEach((id,i)=>$(id).value=config.region[i]);monitorList=await api('/api/monitors');$('captureMonitor').replaceChildren();for(const m of monitorList){const option=document.createElement('option');option.value=m.id;option.textContent='Monitor '+m.id+' ('+m.width+' x '+m.height+')';$('captureMonitor').append(option)}}
 for(const button of document.querySelectorAll('[data-monitor]'))button.onclick=async()=>{button.disabled=true;try{await api('/api/monitoring','POST',{action:button.dataset.monitor});render(await api('/api/state'));$('error').textContent=''}catch(e){err(e)}finally{button.disabled=false}};
@@ -1165,7 +1217,9 @@ $('rulesSave').onclick=async()=>{try{await api('/api/config','PATCH',{rules:$('r
 function parseCorrections(text){const mappings=Object.create(null);for(const [i,line] of text.split('\n').entries()){if(!line.trim())continue;const parts=line.split('->').map(p=>p.trim());if(parts.length!==2||!parts[0]||!parts[1])throw Error('Line '+(i+1)+': use wrongName->correctUsername');if(Object.prototype.hasOwnProperty.call(mappings,parts[0]))throw Error('Repeated incorrect name on line '+(i+1));mappings[parts[0]]=parts[1]}return mappings}
 async function saveCorrections(mappings){await api('/api/config','PATCH',{name_corrections:mappings,registered_players:[]});$('roster').value=Object.entries(mappings).map(([from,to])=>from+'->'+to).join('\n');$('correctionNotice').textContent='Corrections saved. Current scores merged; new players still join automatically.';render(await api('/api/state'));await feed()}
 $('rosterSave').onclick=async()=>{try{await saveCorrections(parseCorrections($('roster').value))}catch(e){err(e)}};
-$('addCorrection').onclick=async()=>{try{const from=$('correctionSource').value.trim(),to=$('correctionTarget').value.trim();if(!from||!to)throw Error('Enter the incorrect name and correct username');const mappings=parseCorrections($('roster').value);mappings[from]=to;await saveCorrections(mappings);$('correctionSource').value='';$('correctionTarget').value=''}catch(e){err(e)}};
+$('addCorrection').onclick=async()=>{try{const from=$('correctionSource').value.trim(),to=$('correctionTarget').value.trim();if(!from||!to||from===to)throw Error('Select two different names');const mappings={...((await api('/api/config')).name_corrections||{})};const target=mappings[to]||to;if(!/^[A-Za-z0-9_]{3,20}$/.test(target))throw Error('Select a valid username as the merge destination');if(target===from)throw Error('Names already resolve to the same player');for(const key of Object.keys(mappings))if(mappings[key]===from)mappings[key]=target;mappings[from]=target;await saveCorrections(mappings);$('correctionSource').value='';$('correctionTarget').value=''}catch(e){err(e)}};
+async function saveTournament(){await api('/api/tournament/settings','PATCH',{name:$('sessionName').value,scoring_mode:$('modeCount').checked?'count':'weight',tagline:$('footerText').value})}
+$('saveTournament').onclick=async()=>{try{await saveTournament();render(await api('/api/state'));await history()}catch(e){err(e)}};
 $('scheduleStart').onclick=async()=>{try{await api('/api/tournament','POST',{action:'schedule',countdown_seconds:Number($('countdownSeconds').value)});render(await api('/api/state'))}catch(e){err(e)}};
 $('save').onclick=async()=>{try{const body={username:$('username').value,fish:$('fish').value,rarity:$('rarity').value,weight_kg:$('weight').value,status:$('eventStatus').value,reason:$('reason').value};const id=$('eventId').value;await api('/api/events'+(id?'/'+id:''),id?'PATCH':'POST',body);$('clear').click();await feed()}catch(e){err(e)}};
 $('clear').onclick=()=>{for(const id of ['eventId','username','fish','rarity','weight','reason'])$(id).value='';$('evidence').textContent='';$('eventStatus').value='confirmed'};
@@ -1189,7 +1243,7 @@ async function loadPatterns(config){
  if(config.patterns.length>1)await persistPatterns(patternEntries,selectedPattern);
 }
 $('patternSelect').onchange=async()=>{const next=Number($('patternSelect').value);try{await persistPatterns(patternEntries,next)}catch(e){$('patternSelect').value=String(selectedPattern);err(e)}};
-function openPatternEditor(index){editingPattern=index;const entry=index===null?{name:'',pattern:''}:patternEntries[index];$('patternName').value=entry.name;$('patternRegex').value=entry.pattern;$('patternEditor').hidden=false;$('patternName').focus()}
+function openPatternEditor(index){editingPattern=index;const entry=index===null?{name:'',pattern:''}:patternEntries[index];$('patternName').value=entry.name;$('patternRegex').value=entry.pattern;$('patternEditor').closest('details').open=true;$('patternEditor').hidden=false;$('patternName').focus()}
 $('editPattern').onclick=()=>openPatternEditor(selectedPattern);
 $('addPattern').onclick=()=>{if(patternEntries.length>=50){err(Error('Provide at most 50 named patterns'));return}openPatternEditor(null)};
 $('cancelPattern').onclick=()=>{$('patternEditor').hidden=true};
@@ -1245,8 +1299,8 @@ def validate_config(update, current):
     if not isinstance(result["patterns"], list) or not 1 <= len(result["patterns"]) <= 12:
         raise ValueError("Provide 1–12 regex patterns")
     for pattern in result["patterns"]:
-        if not isinstance(pattern, str) or len(pattern) > 2000 or not {"username", "fish", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
-            raise ValueError("Pattern needs named username, fish, rarity, weight groups")
+        if not isinstance(pattern, str) or len(pattern) > 2000 or not {"username", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
+            raise ValueError("Pattern needs named username, rarity, weight groups")
     presets = result.get("pattern_presets", [])
     if not isinstance(presets, list) or len(presets) > 50:
         raise ValueError("Provide at most 50 named patterns")
@@ -1260,8 +1314,8 @@ def validate_config(update, current):
         if name.strip().casefold() in names:
             raise ValueError("Pattern names must be unique")
         names.add(name.strip().casefold())
-        if not isinstance(pattern, str) or len(pattern) > 2000 or not {"username", "fish", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
-            raise ValueError("Named patterns need valid regexes with username, fish, rarity, weight groups")
+        if not isinstance(pattern, str) or len(pattern) > 2000 or not {"username", "rarity", "weight"} <= set(re.compile(pattern).groupindex):
+            raise ValueError("Named patterns need valid regexes with username, rarity, weight groups")
     re.compile(result["message_start"])
     if not 0 <= float(result["confidence"]) <= 1:
         raise ValueError("Confidence must be 0–1")
@@ -1389,6 +1443,18 @@ def create_app(runtime):
             raise HTTPException(400, "JSON object required")
         return payload
 
+    @app.patch("/api/tournament/settings")
+    async def tournament_settings(request: Request):
+        payload = await body(request)
+        try:
+            with runtime.control_lock:
+                runtime.store.settings(payload["name"], payload["scoring_mode"], payload.get("tagline", ""))
+                runtime.session_epoch += 1
+                runtime.changed()
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(400, str(exc))
+        return {"ok": True}
+
     @app.post("/api/tournament")
     async def tournament(request: Request):
         payload = await body(request)
@@ -1401,10 +1467,10 @@ def create_app(runtime):
     @app.post("/api/events")
     async def add(request: Request):
         payload = await body(request)
-        settings = runtime.config.snapshot()
+        settings = runtime.config.snapshot() | {"scoring_mode": runtime.store.active()["scoring_mode"]}
         try:
             fields = {"username": str(payload["username"]).strip(), "fish": str(payload["fish"]).strip(),
-                      "rarity": str(payload["rarity"]).strip(), "weight_units": parse_weight(str(payload["weight_kg"]), settings),
+                      "rarity": str(payload["rarity"]).strip(), "weight_units": 0 if settings.get("scoring_mode") == "count" and str(payload.get("weight_kg", "")).strip() in ("", "0", "0.0") else parse_weight(str(payload["weight_kg"]), settings),
                       "status": payload.get("status", "confirmed"), "reason": str(payload.get("reason", "Manual addition")),
                       "raw_text": "[Manual addition]", "confidence": 1.0, "visual_confidence": 1.0}
             validate_manual(fields, settings)
@@ -1421,7 +1487,7 @@ def create_app(runtime):
     async def correct(event_id: int, request: Request):
         payload = await body(request)
         try:
-            await asyncio.to_thread(runtime.store.correct, event_id, payload, runtime.config.snapshot())
+            await asyncio.to_thread(runtime.store.correct, event_id, payload, runtime.config.snapshot() | {"scoring_mode": runtime.store.active()["scoring_mode"]})
             runtime.changed()
         except (ValueError, InvalidOperation) as exc:
             raise HTTPException(400, str(exc))
@@ -1441,7 +1507,7 @@ def create_app(runtime):
     async def configure(request: Request):
         payload = await body(request)
         try:
-            validate_config(payload, runtime.config.snapshot())
+            validate_config(payload, runtime.config.snapshot() | {"scoring_mode": runtime.store.active()["scoring_mode"]})
             if "region" in payload and (any(t.is_alive() for t in runtime.threads) or runtime.restart_pending):
                 raise ValueError("Stop capture and wait for the current OCR call before changing the chat region")
             with runtime.control_lock:
@@ -1498,7 +1564,7 @@ def create_app(runtime):
     @app.post("/api/parse")
     async def parse(request: Request):
         payload = await body(request)
-        return parse_catch(str(payload.get("text", ""))[:4000], 1, 1, runtime.config.snapshot())
+        return parse_catch(str(payload.get("text", ""))[:4000], 1, 1, runtime.config.snapshot() | {"scoring_mode": runtime.store.active()["scoring_mode"]})
 
     @app.get("/stream")
     async def stream(request: Request):
@@ -1854,6 +1920,40 @@ def self_test(directory=None):
     import unittest
 
     class Tests(unittest.TestCase):
+        def test_limited_requires_username_rarity_weight_only(self):
+            settings = self.settings | {"patterns": [LIMITED_PATTERN], "best_effort": True}
+            for text in (
+                "[System] FifthSparkGMZ has perfectly caught a Limited 41.0kg",
+                "FifthSparkGMZ Limited 41.0kg",
+                "[System] FifthSparkGMZ has perfectly caught a Limited 4l.0kg Big g Lumpy",
+                "[System] FifthSparkGMZ has caught a Limited 41.0kg!",
+            ):
+                parsed = parse_catch(text, 1, 1, settings)
+                self.assertEqual(parsed["status"], "confirmed", parsed)
+                self.assertEqual(parsed["username"], "FifthSparkGMZ")
+                self.assertEqual(parsed["weight_units"], parse_weight("41.0", settings))
+            for text in ("caught a Limited 41.0kg Big Rockstar", "Limited 41.0kg",
+                         "FifthSparkGMZ Limited", "FifthSparkGMZ Limited lkg",
+                         "FifthSparkGMZ has caught a Rare 41.0kg Limited Fish!"):
+                self.assertEqual(parse_catch(text, 1, 1, settings)["status"], "review", text)
+            parsed = parse_catch("FifthSparkGMZ Limited 41.0kg", 1, 1, settings)
+            self.assertEqual(parsed["fish"], "Unknown fish")
+            three_groups = r"(?P<username>\w+) (?P<rarity>Limited) (?P<weight>[\d.]+)kg"
+            validate_config({"patterns": [three_groups]}, settings)
+            parsed = parse_catch("FifthSparkGMZ Limited 41.0kg", 1, 1, settings | {"patterns": [three_groups]})
+            self.assertEqual(parsed["status"], "confirmed")
+            strict = parse_catch("FifthSparkGMZ Limited 4l.0kg", 1, 1, settings | {"best_effort": False})
+            self.assertEqual(strict["status"], "review")
+
+        def test_limited_preset_migration_preserves_custom_edits(self):
+            self.config.update({"patterns": [PREVIOUS_LIMITED_PATTERN], "pattern_presets": [
+                {"name": "Limited Fish", "pattern": PREVIOUS_LIMITED_PATTERN},
+                {"name": "Custom", "pattern": COMMON_FISH_PATTERN}]})
+            settings = Config(self.tmp.name).snapshot()
+            self.assertEqual(settings["patterns"], [LIMITED_PATTERN])
+            self.assertEqual(settings["pattern_presets"][0]["pattern"], LIMITED_PATTERN)
+            self.assertEqual(settings["pattern_presets"][1]["pattern"], COMMON_FISH_PATTERN)
+
         def test_named_pattern_library(self):
             import tempfile
             with tempfile.TemporaryDirectory(dir=directory) as folder:
@@ -1911,6 +2011,42 @@ def self_test(directory=None):
 
         def catch(self, identity, text="PlayerA caught Rare Carp (10.5 kg)", confidence=1):
             return self.store.insert(parse_catch(text,confidence,1,self.settings),identity,self.store.active()["id"],now())
+
+        def test_count_mode_ranks_catches_and_weight_mode_recalculates(self):
+            self.catch("heavy", "PlayerA caught Rare Carp (100 kg)")
+            self.catch("small1", "PlayerB caught Rare Carp (1 kg)")
+            self.catch("small2", "PlayerB caught Rare Carp (2 kg)")
+            self.assertEqual(self.store.state()["leaderboard"][0]["username"], "PlayerA")
+            self.store.settings("Catch race", "count", "Catch them all")
+            state = self.store.state()
+            self.assertEqual(state["leaderboard"][0]["username"], "PlayerB")
+            self.assertEqual(state["tournament"]["tagline"], "Catch them all")
+            self.assertEqual(state["encountered_names"], ["PlayerA", "PlayerB"])
+            self.store.settings("Weight race", "weight", "")
+            self.assertEqual(self.store.state()["leaderboard"][0]["username"], "PlayerA")
+
+        def test_tournament_reset_clears_names_and_corrections(self):
+            self.catch("name1", "Chris caught Rare Carp (1 kg)")
+            self.catch("name2", "Chr caught Rare Carp (2 kg)")
+            self.config.update({"name_corrections": {"Chr": "Chris"}})
+            self.store.reconcile_players([], {"Chr": "Chris"})
+            self.assertEqual(self.store.state()["encountered_names"], ["Chr", "Chris"])
+            self.assertEqual(self.store.state()["leaderboard"][0]["catches"], 2)
+            parsed = parse_catch("Chr caught Rare Carp (3 kg)", 1, 1, self.config.snapshot())
+            self.assertEqual(parsed["username"], "Chris")
+            self.runtime.tournament_action("create", "Fresh")
+            self.assertEqual(self.store.state()["encountered_names"], [])
+            self.assertEqual(self.config.snapshot()["name_corrections"], {})
+
+        def test_count_mode_still_requires_qualifying_regex(self):
+            settings = self.settings | {"scoring_mode": "count", "patterns": [LIMITED_PATTERN]}
+            parsed = parse_catch("Chris Limited 4l.0kg", 1, 1, settings)
+            self.assertEqual(parsed["status"], "confirmed")
+            self.assertEqual(parsed["weight_units"], 0)
+            self.assertEqual(parse_catch("Chris Common 1kg Trout!", 1, 1, settings)["status"], "review")
+            for identity in ("count1", "count2"):
+                self.store.insert(parsed, identity, self.store.active()["id"], now())
+            self.assertEqual(self.store.state()["leaderboard"][0]["catches"], 2)
 
         def test_explicit_corrections_keep_automatic_join_and_avoid_fuzzy_merge(self):
             settings=self.settings | {"patterns":[FISCH_PATTERN],"best_effort":True,"name_corrections":{"FifthSparkGMZZ":"FifthSparkGMZ"}}
