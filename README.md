@@ -18,7 +18,7 @@ Settings, evidence, and tournament history stay on each laptop in `%LOCALAPPDATA
 
 ## Tournament controls
 
-In the admin dashboard, enter the tournament title, choose **Total weight** or **Fish caught**, and click **Save tournament settings**. Rankings recalculate from recorded qualifying catches. The OBS overlay displays kilograms or fish counts to match. Enter a custom footer, or leave it blank for the automatic winning rule.
+In the admin dashboard, choosing **Total weight** or **Fish caught** applies the scoring mode immediately. Enter the tournament title and footer and click **Save settings** to save that text. Rankings recalculate from recorded qualifying catches. The OBS overlay displays kilograms or fish counts to match. Enter a custom footer, or leave it blank for the automatic winning rule.
 
 **Qualifying catches** selects the regex pattern used in both scoring modes. In count mode each confirmed matching announcement adds one catch; an unreadable numeric weight does not prevent counting if the announcement still matches the selected regex. A regex that requires a weight token still requires that token to be present.
 
