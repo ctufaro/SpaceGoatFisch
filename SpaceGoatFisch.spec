@@ -1,9 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
+from tesseract_chat_reader import tesseract_bundle_files
 
 datas = []
 binaries = []
 hiddenimports = ['uvicorn.logging', 'uvicorn.loops.auto', 'uvicorn.protocols.http.h11_impl', 'uvicorn.lifespan.on']
+ocr_binaries, ocr_data = tesseract_bundle_files()
+binaries += ocr_binaries
+datas += ocr_data
 tmp_ret = collect_all('rapidocr_onnxruntime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('onnxruntime')

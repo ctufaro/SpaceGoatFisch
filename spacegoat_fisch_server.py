@@ -1,4 +1,4 @@
-"""SpaceGoat Fisch Tournament Server. All application code and web assets live here.
+"""SpaceGoat Fisch Tournament Server; web assets and catch scoring live here.
 
 Run --self-test for deterministic replay/integrity tests, --smoke-test for bundled
 OCR/Qt/HTTP startup checks, --build for a Windows one-directory distribution.
@@ -32,6 +32,8 @@ from decimal import Decimal, InvalidOperation
 
 import cv2
 import numpy as np
+from tesseract_chat_reader import (RollingChatHistory, find_tesseract, read_chat,
+                                   tesseract_available, TESSERACT_INSTALL_HELP)
 
 APP_NAME = "SpaceGoat Fisch Tournament Server"
 LEGACY_PATTERN = r"^(?:\[[^\]]+\]\s*)?(?P<username>[A-Za-z0-9_]{3,20})\s+caught\s+(?:an?\s+)?(?P<rarity>Common|Uncommon|Unusual|Rare|Legendary|Mythical|Exotic|Secret|Limited|Divine)\s+(?P<fish>.+?)\s*\((?P<weight>[\d.,\s]+)\s*kg\)[.!]?$"
@@ -55,8 +57,10 @@ NAMED_PATTERNS = [
 ]
 DEFAULTS = {
     "region": None, "host": "", "port": 8765, "fps": 12,
+    "ocr_backend": "tesseract", "capture_interval": 2.0, "tesseract_path": "",
+    "tesseract_mode": "Contrast", "tesseract_scale": 2, "tesseract_psm": 6,
     "frame_queue": 24, "ocr_queue": 64, "diagnostic": False,
-    "confidence": 0.92, "min_kg": "0.001", "max_kg": "1000000",
+    "confidence": 0.85, "min_kg": "0.001", "max_kg": "1000000",
     "decimal_separator": ".", "parser_verified": True, "best_effort": True,
     "patterns": [FISCH_PATTERN], "message_start": FISCH_START, "registered_players": [], "name_corrections": {}, "rules": "",
     "overlay": {"players": 5, "scale": 1.0, "opacity": 0.86,
@@ -81,7 +85,15 @@ class Config:
         self.values = json.loads(json.dumps(DEFAULTS))
         if self.path.exists():
             previous_text = self.path.read_text(encoding="utf-8")
-            self.values.update(json.loads(previous_text))
+            previous_values = json.loads(previous_text)
+            self.values.update(previous_values)
+            # Tesseract's word scores differ from RapidOCR scores. Migrate only
+            # the old shipped threshold; preserve an operator's custom value.
+            if "ocr_backend" not in previous_values and previous_values.get("confidence") == .92:
+                backup = self.directory / "config.pre-tesseract.json"
+                if not backup.exists():
+                    backup.write_text(previous_text, encoding="utf-8")
+                self.values["confidence"] = DEFAULTS["confidence"]
             # Only replace the shipped illustrative parser. Keep customized rules,
             # selected region, tournament history, and review events intact.
             if self.values.get("patterns") == [LEGACY_PATTERN] and self.values.get("message_start") == LEGACY_START:
@@ -269,14 +281,14 @@ def parse_catch(raw, confidence, visual_confidence, settings):
                 raise
             else:
                 result["weight_units"] = parse_weight(weight[1], settings)
-        if settings.get("best_effort", False):
+        if not np.isfinite(confidence) or confidence < settings["confidence"]:
+            result["reason"] = "Low OCR confidence"
+        elif not np.isfinite(visual_confidence) or visual_confidence < 0.9:
+            result["reason"] = "Uncertain visual insertion"
+        elif settings.get("best_effort", False):
             result.update(status="confirmed", reason="Best-effort live score")
         elif not settings["parser_verified"]:
             result["reason"] = "Parser not verified against real Fisch samples"
-        elif confidence < settings["confidence"]:
-            result["reason"] = "Low OCR confidence"
-        elif visual_confidence < 0.9:
-            result["reason"] = "Uncertain visual insertion"
         else:
             result.update(status="confirmed", reason="")
     except (ValueError, KeyError, InvalidOperation) as exc:
@@ -421,17 +433,8 @@ class Store:
                 fields.update(status="disqualified",reason="Kicked from scoreboard")
             # The capture assigns the session at acquisition, never at OCR completion.
             keys = ("username", "fish", "rarity", "weight_units", "raw_text", "confidence", "visual_confidence", "status", "reason")
-            # Suppress rapid re-reads, including minor fish-text OCR variations.
-            # Equal catches outside this short window remain separate events.
-            if actor == "ocr" and fields.get("reason") == "Best-effort live score" and fields["weight_units"] > 0:
-                duplicate = db.execute("""SELECT id FROM events WHERE tournament_id=?
-                    AND status='confirmed' AND username=? COLLATE NOCASE
-                    AND rarity=? COLLATE NOCASE AND weight_units=?
-                    AND ABS((julianday(timestamp)-julianday(?))*86400) < 3
-                    LIMIT 1""", (tournament_id, fields["username"], fields["rarity"],
-                                fields["weight_units"], timestamp)).fetchone()
-                if duplicate:
-                    return None
+            # The unique visual_id identifies an insertion, not its OCR content.
+            # Separate visual events may legitimately have identical catch fields.
             cursor = db.execute("""INSERT OR IGNORE INTO events(visual_id,tournament_id,timestamp,evidence,
                 username,fish,rarity,weight_units,raw_text,confidence,visual_confidence,status,reason)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (visual_id, tournament_id, timestamp, evidence, *(fields[k] for k in keys)))
@@ -565,12 +568,13 @@ def validate_manual(fields, settings):
 
 
 def glyph_mask(frame):
-    """Keep bright/saturated glyphs; discard most changing 3D backgrounds.
+    """Keep colored and neutral glyphs against a stable dark chat backdrop.
 
     Chat still needs a stable, dark backdrop. Background motion triggers review.
     """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = ((hsv[:, :, 2] > 170) & ((hsv[:, :, 1] < 100) | (hsv[:, :, 2] > 220))).astype(np.uint8)
+    # Maximum channel brightness preserves gray and saturated purple text that
+    # luminance/saturation filters erase. This mask tracks rows; OCR gets color.
+    mask = (frame.max(axis=2) > 110).astype(np.uint8)
     return mask
 
 
@@ -619,6 +623,62 @@ def ocr_text_rows(result):
 def ocr_input(image):
     scaled = cv2.resize(image,None,fx=2,fy=2,interpolation=cv2.INTER_CUBIC)
     return cv2.copyMakeBorder(scaled,12,12,12,12,cv2.BORDER_CONSTANT,value=(0,0,0))
+
+
+def ocr_message_groups(result, settings):
+    return group_chat_rows(ocr_text_rows(result), settings)
+
+
+def group_chat_rows(rows, settings):
+    groups = []
+    for text, score in rows:
+        if groups and not re.search(settings["message_start"], text, re.IGNORECASE):
+            groups[-1][0] += " " + text
+            groups[-1][1] = min(groups[-1][1], score)
+        else:
+            groups.append([text, score])
+    return groups
+
+
+def recognize_chat(engine, image, settings):
+    """Retry weak reads with color-independent contrast; never merge OCR passes."""
+    result, _ = engine(ocr_input(image))
+    primary = ocr_message_groups(result, settings)
+    def parsed(groups):
+        return [parse_catch(text, score, 1, settings) for text, score in groups]
+    first = parsed(primary)
+    # Color boundaries can produce a confident, isolated extra letter inside a
+    # fish descriptor. Verify those reads too; never delete a letter by guessing.
+    suspicious = any(re.search(r"\b[A-Za-z]\b", p["fish"]) for p in first)
+    if primary and not suspicious and all(p["status"] == "confirmed" for p in first):
+        return primary
+    # Max channel preserves saturated purple/green and neutral gray alike.
+    # Invert onto white without binarizing away antialiased character edges.
+    gray = cv2.normalize(255-image.max(axis=2), None, 0, 255, cv2.NORM_MINMAX)
+    alternate = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    alternate = cv2.resize(alternate,None,fx=2,fy=2,interpolation=cv2.INTER_CUBIC)
+    alternate = cv2.copyMakeBorder(alternate,12,12,12,12,cv2.BORDER_CONSTANT,value=(255,255,255))
+    try:
+        result, _ = engine(alternate)
+    except Exception:
+        logging.exception("Contrast OCR retry failed; preserving the original read")
+        return primary
+    fallback = ocr_message_groups(result, settings)
+    second = parsed(fallback)
+    def quality(groups, readings):
+        return (sum(p["status"] == "confirmed" for p in readings),
+                min((score if np.isfinite(score) else 0 for _,score in groups),default=0))
+    # Different catch counts cannot safely be aligned across passes. If the
+    # first pass already extracted any catch, preserve it for operator review.
+    extracted = lambda p: tuple(p[k] for k in ("username","rarity","weight_units","fish"))
+    if (len(first) != len(second) and any(p["username"] for p in first)
+            and any(p["username"] for p in second)):
+        return [[text,0.0] for text,_ in primary]
+    chosen = fallback if quality(fallback, second) > quality(primary, first) else primary
+    if len(first) == len(second):
+        return [[primary[i][0],0.0] if a["username"] and b["username"] and extracted(a) != extracted(b)
+                else chosen[i] for i,(a,b) in enumerate(zip(first,second))]
+    return chosen
 
 
 class VisualTracker:
@@ -694,6 +754,15 @@ class VisualTracker:
             "Ambiguous scrolling: review required" if ambiguous else None)
 
 
+class TesseractLiveEngine:
+    """The same capture preprocessing and Tesseract call as the standalone tool."""
+    def read_rows(self, image, settings):
+        reading = read_chat(image, settings.get("tesseract_path") or find_tesseract(),
+                            settings["tesseract_mode"], settings["tesseract_scale"], settings["tesseract_psm"])
+        scores = reading.line_confidences or (reading.confidence,)*len(reading.lines)
+        return [(line,max(0.0,min(1.0,score/100))) for line,score in zip(reading.lines,scores)]
+
+
 class Runtime:
     def __init__(self, config, store):
         self.config, self.store = config, store
@@ -746,6 +815,12 @@ class Runtime:
         return state
 
     def initialize_ocr(self):
+        if self.config.snapshot()["ocr_backend"] == "tesseract":
+            executable = self.config.snapshot().get("tesseract_path") or find_tesseract()
+            if not tesseract_available(executable):
+                raise RuntimeError("Tesseract not found.\n\n"+TESSERACT_INSTALL_HELP)
+            self.engine = TesseractLiveEngine()
+            return
         from rapidocr_onnxruntime import RapidOCR
         import rapidocr_onnxruntime
         # Package-relative paths work in source and PyInstaller's _internal folder.
@@ -763,14 +838,18 @@ class Runtime:
         with self.ocr_lock:
             if self.engine is None:
                 self.initialize_ocr()
-            result, _ = self.engine(ocr_input(image))
-        rows = ocr_text_rows(result)
+            rows = self.read_rows(image, self.config.snapshot())
         self.update_health(preview="\n".join(text for text,confidence in rows) or "No text recognized in the selected capture. Check the region and Roblox visibility.",
                            last_ocr=now())
         if self.config.snapshot()["diagnostic"]:
             directory = self.config.directory / "evidence"
             directory.mkdir(exist_ok=True)
             cv2.imwrite(str(directory / "latest-preview.png"), image)
+
+    def read_rows(self, image, settings):
+        if hasattr(self.engine, "read_rows"):
+            return self.engine.read_rows(image, settings)
+        return recognize_chat(self.engine, image, settings)
 
     def request_preview(self):
         if self.preview_thread and self.preview_thread.is_alive():
@@ -820,7 +899,7 @@ class Runtime:
             self.frames = queue.Queue(settings["frame_queue"])
             self.candidates = queue.Queue(settings["ocr_queue"])
             self.run_id = uuid.uuid4().hex
-            self.update_health(monitoring=True, capture="starting", ocr="loading bundled models")
+            self.update_health(monitoring=True, capture="starting", ocr=f"loading {settings['ocr_backend']}")
             self.threads = [threading.Thread(target=fn, name=name, daemon=True) for fn, name in
                             ((lambda: self.guarded(self.capture_loop), "capture"),
                              (lambda: self.guarded(self.track_loop, tracking=True), "tracking"),
@@ -957,14 +1036,145 @@ class Runtime:
                         with self.lock:
                             self.health["frame_overflows"] += 1
                         self.warn("Frame buffer overflow; visual events may be missing. Re-baselining.")
-                    self.monitor_stop.wait(max(0, 1/settings["fps"]-(time.monotonic()-began)))
+                    interval = settings["capture_interval"] if settings["ocr_backend"] == "tesseract" else 1/settings["fps"]
+                    self.monitor_stop.wait(max(0, interval-(time.monotonic()-began)))
         except Exception as exc:
             logging.exception("Capture failed")
             self.warn(f"Capture failure: {exc}")
             self.update_health(capture="failed", monitoring=False)
             self.monitor_stop.set()
 
+    def track_full_chat(self):
+        """Forward full crops; ordered OCR history replaces pixel-row insertion."""
+        sequence = 0
+        try:
+            while not self.cancel_work.is_set() and (not self.monitor_stop.is_set() or not self.frames.empty()):
+                try:
+                    frame, session, status, stamp, generation, session_epoch = self.frames.get(timeout=.2)
+                except queue.Empty:
+                    continue
+                try:
+                    sequence += 1
+                    epoch = (session, status, generation, session_epoch)
+                    item = (frame, 1.0, f"{self.run_id}:{session}:{sequence}", session, stamp, epoch, status)
+                    try:
+                        self.candidates.put_nowait(item)
+                    except queue.Full:
+                        with self.lock:
+                            self.health["ocr_overflows"] += 1
+                        self.warn("OCR queue overflow: chat overlap may be missing; evidence saved")
+                        self.save_evidence(frame, item[2], force=True)
+                finally:
+                    self.frames.task_done()
+        finally:
+            self.track_done.set()
+
+    def tesseract_ocr_loop(self):
+        """Read full chat, establish a baseline, then score only ordered new rows."""
+        try:
+            with self.ocr_lock:
+                if self.engine is None:
+                    self.initialize_ocr()
+        except Exception as exc:
+            self.warn(f"OCR initialization failed: {exc}")
+            self.update_health(ocr="failed", monitoring=False)
+            self.monitor_stop.set()
+            return
+        history = RollingChatHistory()
+        context = None
+        previous_pixels = None
+        baselined = False
+        pending = None
+        wrap_timeout = max(1.5, 3*self.config.snapshot()["capture_interval"])
+        self.update_health(ocr="ready (Tesseract)")
+        while not self.cancel_work.is_set() and (not self.track_done.is_set() or not self.candidates.empty()):
+            try:
+                item = self.candidates.get(timeout=.2)
+            except queue.Empty:
+                if pending and time.monotonic()-pending["since"] > wrap_timeout:
+                    self.persist_ocr(pending)
+                    pending = None
+                continue
+            image, _, identity, session, stamp, epoch, status = item
+            try:
+                if epoch[-1] != self.session_epoch:
+                    continue
+                if context != epoch:
+                    if pending:
+                        self.persist_ocr(pending)
+                    pending = None
+                    history.clear()
+                    previous_pixels = None
+                    baselined = False
+                    context = epoch
+                fingerprint = hashlib.blake2b(image.tobytes(), digest_size=16).digest()
+                if fingerprint == previous_pixels:
+                    continue
+                settings = self.config.snapshot() | {"scoring_mode": self.store.active()["scoring_mode"]}
+                with self.ocr_lock:
+                    rows = self.read_rows(image, settings)
+                if self.cancel_work.is_set() or epoch[-1] != self.session_epoch:
+                    continue
+                self.update_health(ocr="ready (Tesseract)", last_ocr=now(),
+                                   preview="\n".join(text for text,_ in rows) or "No chat text recognized")
+                if not rows:
+                    continue
+                previous_pixels = fingerprint
+                delta = history.update([text for text,_ in rows])
+                self.update_health(chat_history=delta.status)
+                if not baselined:
+                    baselined = True
+                    self.update_health(chat_history="Baseline established; visible messages excluded")
+                    continue
+                if status != "running" or not delta.lines:
+                    continue
+                visual = 1.0 if delta.overlap else .35
+                if visual < .9:
+                    self.warn("No reliable chat text overlap; visible catches held for review")
+                    if pending:
+                        self.persist_ocr(pending)
+                    pending = None
+                evidence = self.save_evidence(image, identity, force=visual < .9)
+                groups = group_chat_rows(rows[-len(delta.lines):], settings)
+                for index,(text,score) in enumerate(groups):
+                    piece = {"text":text,"confidence":score,"visual":visual,"identity":f"{identity}:{index}",
+                             "session":session,"stamp":stamp,"evidence":evidence,"since":time.monotonic(),
+                             "epoch":epoch[-1]}
+                    if pending:
+                        if (time.monotonic()-pending["since"] <= wrap_timeout
+                                and not re.search(settings["message_start"],text,re.IGNORECASE)):
+                            piece.update(text=pending["text"]+" "+text,
+                                         confidence=min(score,pending["confidence"]),
+                                         visual=min(visual,pending["visual"]),identity=pending["identity"],
+                                         stamp=pending["stamp"],since=pending["since"],
+                                         evidence=pending["evidence"] or evidence)
+                        else:
+                            self.persist_ocr(pending)
+                        pending = None
+                    parsed = parse_catch(piece["text"],piece["confidence"],piece["visual"],settings)
+                    if parsed["status"] == "review" and not piece["evidence"]:
+                        piece["evidence"] = self.save_evidence(image,identity,force=True)
+                    if parsed["status"] == "confirmed" or parsed["weight_units"] > 0 or index < len(groups)-1:
+                        self.persist_ocr(piece)
+                    else:
+                        pending = piece
+            except Exception as exc:
+                logging.exception("Tesseract chat capture failed")
+                self.warn(f"Tesseract OCR failed: {exc}; screenshot saved for review")
+                evidence = self.save_evidence(image,identity,force=True)
+                if status == "running":
+                    self.persist_ocr({"text":f"[OCR failure: {exc}]","confidence":0,"visual":0,
+                                      "identity":identity,"session":session,"stamp":stamp,
+                                      "evidence":evidence,"epoch":epoch[-1]})
+            finally:
+                self.candidates.task_done()
+        if pending and not self.cancel_work.is_set():
+            self.persist_ocr(pending)
+        self.update_health(ocr="idle")
+
     def track_loop(self):
+        if self.config.snapshot()["ocr_backend"] == "tesseract":
+            return self.track_full_chat()
         tracker = VisualTracker()
         epoch = None
         while not self.cancel_work.is_set() and (not self.monitor_stop.is_set() or not self.frames.empty()):
@@ -1005,6 +1215,8 @@ class Runtime:
         return path.name
 
     def ocr_loop(self):
+        if self.config.snapshot()["ocr_backend"] == "tesseract":
+            return self.tesseract_ocr_loop()
         try:
             with self.ocr_lock:
                 if self.engine is None:
@@ -1039,31 +1251,25 @@ class Runtime:
             evidence = None
             try:
                 evidence = self.save_evidence(image, identity, force=visual < .9)
-                scaled = ocr_input(image)
                 with self.ocr_lock:
-                    result, _ = self.engine(scaled)
+                    groups = recognize_chat(self.engine, image, settings)
                 if self.cancel_work.is_set():
                     continue
-                lines = ocr_text_rows(result)
-                groups = []
-                for text, score in lines:
-                    if groups and not re.search(settings["message_start"], text, re.IGNORECASE):
-                        groups[-1][0] += " " + text
-                        groups[-1][1] = min(groups[-1][1], float(score))
-                    else:
-                        groups.append([text, float(score)])
                 if not groups:
                     groups = [["[OCR returned no text]", 0.0]]
                 for index, (text, score) in enumerate(groups):
                     piece = {"text": text, "confidence": score, "visual": visual, "identity": f"{identity}:{index}",
                              "session": session, "stamp": stamp, "evidence": evidence, "since": time.monotonic()}
                     if pending:
-                        if pending["session"] == session and not re.search(settings["message_start"], text, re.IGNORECASE):
+                        if (pending["session"] == session and time.monotonic()-pending["since"] <= 1.5
+                                and not re.search(settings["message_start"], text, re.IGNORECASE)):
                             piece["text"] = pending["text"] + " " + text
                             piece["confidence"] = min(score, pending["confidence"])
                             piece["visual"] = min(visual, pending["visual"])
                             piece["identity"] = pending["identity"]
                             piece["stamp"] = pending["stamp"]
+                            piece["since"] = pending["since"]
+                            piece["evidence"] = pending["evidence"] or piece["evidence"]
                         else:
                             self.persist_ocr(pending)
                         pending = None
@@ -1090,6 +1296,8 @@ class Runtime:
     def persist_ocr(self, piece):
         with self.control_lock:
             if self.cancel_work.is_set():
+                return
+            if piece.get("epoch", self.session_epoch) != self.session_epoch:
                 return
             settings = self.config.snapshot() | {"scoring_mode": self.store.active()["scoring_mode"]}
             fields = parse_catch(piece["text"], piece["confidence"], piece["visual"], settings)
@@ -1212,7 +1420,7 @@ th{position:sticky;top:0;background:#112735;z-index:1}td{overflow-wrap:anywhere}
 <h1>SpaceGoat Tournament Control</h1><p class="muted">Corrections are audited. Review events contribute zero until confirmed.</p>
 <div class="panel"><span id="auth">Connected</span></div><div id="error" class="error"></div>
 <div id="private"><div class="panel tournament-panel"><h2 id="title"></h2><div class="grid"><label>Tournament title<input id="sessionName" maxlength="120" placeholder="Tournament title"></label><label><input type="radio" name="scoringMode" id="modeWeight" value="weight" checked> Total weight</label><label><input type="radio" name="scoringMode" id="modeCount" value="count"> Fish caught</label><label>Footer<input id="footerText" maxlength="200" placeholder="Automatic winning rule"></label><button id="saveTournament">Save settings</button></div><div class="actions"><button data-action="create">Create</button><button data-action="start">Start now</button><button data-action="pause">Pause</button><button data-action="resume">Resume</button><button data-action="finish">Finish</button><button data-action="reset">Reset into new session</button><button id="export">Export CSV</button></div><div class="grid" style="margin-top:12px"><label>Start countdown (seconds)<input id="countdownSeconds" type="number" min="1" max="86400" value="60"></label><button id="scheduleStart">Start with countdown</button><button data-action="cancel_countdown">Cancel countdown</button></div><p id="timer" style="font-size:22px;font-weight:700;font-variant-numeric:tabular-nums"></p><p class="muted">Create a tournament, then start now or use a countdown. Pause freezes scoring and the elapsed clock; Resume continues both. Finish keeps the final scores. Capture starts automatically when you start or schedule the tournament.</p><div id="stats"></div><div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable tournament table"><table><thead><tr><th>Rank</th><th>Player</th><th id="scoreHeader">Total kg</th><th>Catches</th><th>Largest</th><th>Average</th><th>Actions</th></tr></thead><tbody id="leaders"></tbody></table></div></div>
-<div class="panel"><h2>Qualifying catches</h2><p class="muted">The selected pattern chooses which catches qualify in both scoring modes.</p><label for="patternSelect">Pattern</label><div class="grid" style="align-items:center"><select id="patternSelect" aria-label="Active pattern"></select><button id="editPattern" type="button">Edit</button><button id="deletePattern" type="button">Delete</button><button id="addPattern" type="button">Add pattern</button></div><span id="patternStatus" role="status"></span></div><div class="panel"><h2>Player name corrections</h2><p class="muted">Select an encountered name and merge it into another name. Past scores and future catches are combined. Names and corrections reset for each new tournament.</p><details><summary>Existing corrections</summary><textarea id="roster" readonly></textarea><button id="rosterSave" hidden>Save corrections</button></details><div class="grid"><label>Merge this name<select id="correctionSource"></select></label><label>Into this name<select id="correctionTarget"></select></label><datalist id="playerNames"></datalist><button id="addCorrection">Merge names</button></div><p id="correctionNotice"></p><p id="kickedPlayers"></p></div><div class="panel"><h2>Overlay rules</h2><label>Rules shown below the timer<textarea id="rulesText" maxlength="2000" placeholder="Common fish only. Highest total weight wins."></textarea></label><button id="rulesSave">Save rules</button></div><div class="panel"><h2>Capture / OCR</h2><p id="captureStatus"></p><div class="grid"><button data-monitor="start">Start capture</button><button data-monitor="stop">Stop capture</button><button data-monitor="restart">Restart capture</button><button data-monitor="preview">Test OCR</button></div><p class="muted">Start now, Resume, and Start with countdown start capture automatically. Keep the game chat visible and unobstructed; place this dashboard on another monitor when possible.</p><details><summary>Chat region setup</summary><p>Select a monitor, load its screenshot, then drag around the catch messages. Click Save chat region. Stop capture before changing the region.</p><div class="grid"><select id="captureMonitor"></select><button id="loadScreen">Load monitor screenshot</button></div><div class="preview-scroll"><canvas id="regionCanvas" style="display:none;width:100%;max-width:900px;touch-action:none;cursor:crosshair;margin:12px 0"></canvas></div><div class="grid"><label>Left<input id="regionLeft" type="number"></label><label>Top<input id="regionTop" type="number"></label><label>Width<input id="regionWidth" type="number" min="60"></label><label>Height<input id="regionHeight" type="number" min="30"></label><button id="saveRegion">Save chat region</button></div><p id="regionNotice"></p></details><details><summary>Detailed capture health</summary><pre id="health"></pre></details><details><summary>OCR preview</summary><pre id="preview"></pre></details></div>
+<div class="panel"><h2>Qualifying catches</h2><p class="muted">The selected pattern chooses which catches qualify in both scoring modes.</p><label for="patternSelect">Pattern</label><div class="grid" style="align-items:center"><select id="patternSelect" aria-label="Active pattern"></select><button id="editPattern" type="button">Edit</button><button id="deletePattern" type="button">Delete</button><button id="addPattern" type="button">Add pattern</button></div><span id="patternStatus" role="status"></span></div><div class="panel"><h2>Player name corrections</h2><p class="muted">Select an encountered name and merge it into another name. Past scores and future catches are combined. Names and corrections reset for each new tournament.</p><details><summary>Existing corrections</summary><textarea id="roster" readonly></textarea><button id="rosterSave" hidden>Save corrections</button></details><div class="grid"><label>Merge this name<select id="correctionSource"></select></label><label>Into this name<select id="correctionTarget"></select></label><datalist id="playerNames"></datalist><button id="addCorrection">Merge names</button></div><p id="correctionNotice"></p><p id="kickedPlayers"></p></div><div class="panel"><h2>Overlay rules</h2><label>Rules shown below the timer<textarea id="rulesText" maxlength="2000" placeholder="Common fish only. Highest total weight wins."></textarea></label><button id="rulesSave">Save rules</button></div><div class="panel"><h2>Capture / OCR</h2><details open><summary>Reader settings</summary><div class="grid"><label>Reader<select id="ocrBackend"><option value="tesseract">Tesseract + rolling history</option><option value="rapidocr">RapidOCR (legacy)</option></select></label><label>Capture every (seconds)<input id="captureInterval" type="number" min="0.2" max="3600" step="0.1"></label><label>Image<select id="tesseractMode"><option>Contrast</option><option>Color</option><option>Threshold</option></select></label><label>Scale<select id="tesseractScale"><option>1</option><option>2</option><option>3</option></select></label><label>PSM<select id="tesseractPsm"><option>6</option><option>11</option><option>3</option></select></label></div><label>Tesseract executable (blank = automatic)<input id="tesseractPath" placeholder="Automatically detected"></label><button id="saveReader">Save reader settings</button><p id="readerNotice">Stop capture before changing reader settings. The first capture establishes a baseline.</p><details><summary>Install Tesseract on Windows</summary><ol><li>Open the <a href="https://github.com/UB-Mannheim/tesseract/wiki" target="_blank" rel="noopener noreferrer">Tesseract Windows installer page</a> and download the 64-bit installer.</li><li>Run the installer with English language data selected. Keep the default folder: <code>C:\Program Files\Tesseract-OCR</code>.</li><li>Restart this app. The default location is detected automatically; no PATH changes are needed.</li><li>If you chose another folder, enter the full path to <code>tesseract.exe</code> above and save reader settings.</li></ol><p>Pulling the repository installs Python dependencies only; Tesseract needs this one-time installation. Rebuilt packaged apps include it.</p></details></details><p id="captureStatus"></p><div class="grid"><button data-monitor="start">Start capture</button><button data-monitor="stop">Stop capture</button><button data-monitor="restart">Restart capture</button><button data-monitor="preview">Test OCR</button></div><p class="muted">Start now, Resume, and Start with countdown start capture automatically. Keep the game chat visible and unobstructed; place this dashboard on another monitor when possible.</p><details><summary>Chat region setup</summary><p>Select a monitor, load its screenshot, then drag around the catch messages. Click Save chat region. Stop capture before changing the region.</p><div class="grid"><select id="captureMonitor"></select><button id="loadScreen">Load monitor screenshot</button></div><div class="preview-scroll"><canvas id="regionCanvas" style="display:none;width:100%;max-width:900px;touch-action:none;cursor:crosshair;margin:12px 0"></canvas></div><div class="grid"><label>Left<input id="regionLeft" type="number"></label><label>Top<input id="regionTop" type="number"></label><label>Width<input id="regionWidth" type="number" min="60"></label><label>Height<input id="regionHeight" type="number" min="30"></label><button id="saveRegion">Save chat region</button></div><p id="regionNotice"></p></details><details><summary>Detailed capture health</summary><pre id="health"></pre></details><details><summary>OCR preview</summary><pre id="preview"></pre></details></div>
 <details class="panel"><summary>Add or correct a catch</summary><div class="grid"><label>Event ID (blank = add)<input id="eventId" readonly></label><label>Username<input id="username"></label><label>Fish<input id="fish"></label><label>Rarity<input id="rarity"></label><label>Weight kg<input id="weight"></label><label>Status<select id="eventStatus"><option>confirmed</option><option>review</option><option>disqualified</option></select></label><label>Reason<input id="reason"></label></div><p><button id="save">Save catch</button> <button id="clear">Clear form</button></p><pre id="evidence"></pre></details>
 <div class="panel feed-panel"><h2>Catch feed / history</h2><div class="actions"><select id="history"></select><button id="previous">Previous</button><button id="next">Next</button><span id="pagination"></span></div><div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable tournament table"><table><thead><tr><th>ID / time</th><th>Player / fish</th><th>kg</th><th>Confidence</th><th>Status / OCR</th><th>Actions</th></tr></thead><tbody id="events"></tbody></table></div></div>
 <details class="panel"><summary>Overlay settings</summary><div class="grid"><label>Players<input id="players" type="number" min="1" max="10"></label><label>Scale<input id="scale" type="number" step="0.1" min="0.3" max="3"></label><label>Panel opacity<input id="opacity" type="number" step="0.05" min="0" max="1"></label><label>Vertical<input id="vertical" type="checkbox"></label><label>Recent catches<input id="recent" type="checkbox"></label><button id="overlaySave">Apply overlay</button></div></details>
@@ -1232,8 +1440,9 @@ async function load(){try{render(await api('/api/state'));const config=await api
 async function history(){const previous=$('history').value;const sessions=await api('/api/history');$('history').replaceChildren();for(const t of sessions){let o=document.createElement('option');o.value=t.id;o.textContent=t.name+' • '+t.status+' • #'+t.id;$('history').append(o)}$('history').value=previous||activeId}
 for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{if(['reset','create'].includes(b.dataset.action)&&!confirm('Archive current session and create a new one?'))return;await api('/api/tournament','POST',{action:b.dataset.action,name:$('sessionName').value||'Fisch Weight Championship'});if(['reset','create'].includes(b.dataset.action))await saveTournament();render(await api('/api/state'));$('history').value='';offset=0;await history();await feed()}catch(e){err(e)}};
 const regionFields=['regionLeft','regionTop','regionWidth','regionHeight'];let monitorList=[],screenImage=null,screenMonitor=null,dragStart=null;
-async function loadCapture(config){if(config.region)regionFields.forEach((id,i)=>$(id).value=config.region[i]);monitorList=await api('/api/monitors');$('captureMonitor').replaceChildren();for(const m of monitorList){const option=document.createElement('option');option.value=m.id;option.textContent='Monitor '+m.id+' ('+m.width+' x '+m.height+')';$('captureMonitor').append(option)}}
+async function loadCapture(config){$('ocrBackend').value=config.ocr_backend;$('captureInterval').value=config.capture_interval;$('tesseractMode').value=config.tesseract_mode;$('tesseractScale').value=config.tesseract_scale;$('tesseractPsm').value=config.tesseract_psm;$('tesseractPath').value=config.tesseract_path;if(config.region)regionFields.forEach((id,i)=>$(id).value=config.region[i]);monitorList=await api('/api/monitors');$('captureMonitor').replaceChildren();for(const m of monitorList){const option=document.createElement('option');option.value=m.id;option.textContent='Monitor '+m.id+' ('+m.width+' x '+m.height+')';$('captureMonitor').append(option)}}
 for(const button of document.querySelectorAll('[data-monitor]'))button.onclick=async()=>{button.disabled=true;try{await api('/api/monitoring','POST',{action:button.dataset.monitor});render(await api('/api/state'));$('error').textContent=''}catch(e){err(e)}finally{button.disabled=false}};
+$('saveReader').onclick=async()=>{try{await api('/api/config','PATCH',{ocr_backend:$('ocrBackend').value,capture_interval:Number($('captureInterval').value),tesseract_mode:$('tesseractMode').value,tesseract_scale:Number($('tesseractScale').value),tesseract_psm:Number($('tesseractPsm').value),tesseract_path:$('tesseractPath').value.trim()});$('readerNotice').textContent='Reader settings saved. Start capture to use them.';$('error').textContent=''}catch(e){err(e)}};
 $('saveRegion').onclick=async()=>{try{const region=regionFields.map(id=>Number($(id).value));await api('/api/config','PATCH',{region});$('regionNotice').textContent='Chat region saved. Start the tournament or restart capture.';$('error').textContent=''}catch(e){err(e)}};
 $('loadScreen').onclick=async()=>{try{screenMonitor=monitorList.find(m=>m.id===Number($('captureMonitor').value));if(!screenMonitor)throw Error('Select a monitor');const response=await fetch('/api/monitor-image/'+screenMonitor.id,{cache:'no-store'});if(!response.ok)throw Error('Screenshot failed: '+response.status);const url=URL.createObjectURL(await response.blob());const picture=new Image();try{picture.src=url;await picture.decode();screenImage=picture;const canvas=$('regionCanvas');canvas.width=picture.naturalWidth;canvas.height=picture.naturalHeight;canvas.style.display='block';canvas.getContext('2d').drawImage(picture,0,0)}finally{URL.revokeObjectURL(url)}}catch(e){err(e)}};
 const canvas=$('regionCanvas');const point=e=>{const rect=canvas.getBoundingClientRect();return {x:Math.max(0,Math.min(canvas.width,(e.clientX-rect.left)*canvas.width/rect.width)),y:Math.max(0,Math.min(canvas.height,(e.clientY-rect.top)*canvas.height/rect.height))}};
@@ -1285,9 +1494,22 @@ const stream=new EventSource('/stream');stream.addEventListener('state',e=>{rend
 
 def validate_config(update, current):
     allowed = {"overlay", "patterns", "pattern_presets", "message_start", "decimal_separator", "min_kg", "max_kg", "confidence", "parser_verified", "best_effort", "region", "registered_players", "name_corrections", "rules"}
+    allowed |= {"ocr_backend","capture_interval","tesseract_path","tesseract_mode","tesseract_scale","tesseract_psm"}
     if set(update) - allowed:
         raise ValueError("Unsupported setting")
     result = current | update
+    if result["ocr_backend"] not in ("tesseract","rapidocr"):
+        raise ValueError("Choose Tesseract or RapidOCR")
+    if not .2 <= float(result["capture_interval"]) <= 3600:
+        raise ValueError("Capture interval must be 0.2-3600 seconds")
+    if result["tesseract_mode"] not in ("Contrast","Color","Threshold"):
+        raise ValueError("Invalid Tesseract preprocessing mode")
+    if type(result["tesseract_scale"]) is not int or result["tesseract_scale"] not in (1,2,3):
+        raise ValueError("Tesseract scale must be 1, 2 or 3")
+    if type(result["tesseract_psm"]) is not int or result["tesseract_psm"] not in (3,6,11):
+        raise ValueError("Tesseract PSM must be 3, 6 or 11")
+    if not isinstance(result["tesseract_path"],str) or len(result["tesseract_path"]) > 2000:
+        raise ValueError("Invalid Tesseract executable path")
     if not isinstance(result.get("rules",""),str) or len(result.get("rules",""))>2000:
         raise ValueError("Rules must be text of at most 2000 characters")
     corrections = result.get("name_corrections",{})
@@ -1537,10 +1759,15 @@ def create_app(runtime):
         payload = await body(request)
         try:
             validate_config(payload, runtime.config.snapshot() | {"scoring_mode": runtime.store.active()["scoring_mode"]})
-            if "region" in payload and (any(t.is_alive() for t in runtime.threads) or runtime.restart_pending):
-                raise ValueError("Stop capture and wait for the current OCR call before changing the chat region")
             with runtime.control_lock:
+                capture_keys = {"region","ocr_backend","capture_interval","tesseract_path","tesseract_mode","tesseract_scale","tesseract_psm"}
+                if capture_keys & payload.keys() and (any(t.is_alive() for t in runtime.threads) or runtime.restart_pending
+                        or (runtime.preview_thread and runtime.preview_thread.is_alive())):
+                    raise ValueError("Stop capture and wait for OCR/preview before changing capture settings")
                 runtime.config.update(payload)
+                if capture_keys & payload.keys():
+                    with runtime.ocr_lock:
+                        runtime.engine = None
                 if "registered_players" in payload or "name_corrections" in payload:
                     settings = runtime.config.snapshot()
                     runtime.store.reconcile_players(settings.get("registered_players",[]),settings.get("name_corrections",{}))
@@ -1651,7 +1878,7 @@ def launch_gui(runtime, host, port, smoke=False):
     from PySide6.QtCore import Qt, QTimer, QRect, QPoint
     from PySide6.QtGui import QPainter, QColor, QPen
     from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                                  QLabel, QPushButton, QTextEdit, QLineEdit, QCheckBox, QSpinBox,
+                                  QLabel, QPushButton, QTextEdit, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox,
                                   QComboBox, QFormLayout, QMessageBox, QDialog)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
@@ -1673,7 +1900,7 @@ def launch_gui(runtime, host, port, smoke=False):
             painter.fillRect(self.rect(), QColor(0, 0, 0, 60))
             painter.setPen(QPen(QColor("#7effbe"), 2))
             painter.drawRect(QRect(self.origin, self.end).normalized())
-            painter.drawText(20, 30, "Drag around the bottom 3–5 chat lines. Escape cancels.")
+            painter.drawText(20, 30, "Drag around complete chat messages. Escape cancels.")
 
         def mousePressEvent(self, event):
             self.origin = self.end = event.position().toPoint()
@@ -1720,6 +1947,12 @@ def launch_gui(runtime, host, port, smoke=False):
                     button.setEnabled(False)
             self.region = QLabel()
             layout.addWidget(self.region)
+            if (runtime.config.snapshot()["ocr_backend"] == "tesseract"
+                    and not tesseract_available(runtime.config.snapshot()["tesseract_path"])):
+                install_help = QLabel("Tesseract is not installed.\n\n"+TESSERACT_INSTALL_HELP)
+                install_help.setWordWrap(True)
+                install_help.setStyleSheet("color:#ffd16d;padding:8px")
+                layout.addWidget(install_help)
             self.status = QLabel()
             self.status.setWordWrap(True)
             layout.addWidget(self.status)
@@ -1741,11 +1974,12 @@ def launch_gui(runtime, host, port, smoke=False):
             self.diagnostic.setChecked(runtime.config.snapshot()["diagnostic"])
             self.diagnostic.toggled.connect(lambda enabled: runtime.config.update({"diagnostic": enabled}))
             settings_row.addWidget(self.diagnostic)
-            self.fps = QSpinBox()
-            self.fps.setRange(3, 30)
-            self.fps.setValue(runtime.config.snapshot()["fps"])
-            self.fps.valueChanged.connect(lambda value: runtime.config.update({"fps": value}))
-            settings_row.addWidget(QLabel("Capture FPS (next start)"))
+            self.fps = QDoubleSpinBox()
+            self.fps.setRange(.2, 3600)
+            self.fps.setSingleStep(.2)
+            self.fps.setValue(runtime.config.snapshot()["capture_interval"])
+            self.fps.valueChanged.connect(lambda value: runtime.config.update({"capture_interval": value}))
+            settings_row.addWidget(QLabel("Capture seconds (next start)"))
             settings_row.addWidget(self.fps)
             layout.addWidget(QLabel("OCR Preview"))
             self.preview = QTextEdit()
@@ -2023,7 +2257,8 @@ def self_test(directory=None):
         def setUp(self):
             self.tmp = tempfile.TemporaryDirectory(dir=directory)
             self.config = Config(self.tmp.name)
-            self.config.update({"patterns": [LEGACY_PATTERN], "message_start": LEGACY_START, "parser_verified": True, "best_effort": False})
+            self.config.update({"patterns": [LEGACY_PATTERN], "message_start": LEGACY_START, "parser_verified": True, "best_effort": False,
+                                "ocr_backend":"rapidocr"})
             self.settings = self.config.snapshot()
             self.store = Store(Path(self.tmp.name)/"test.sqlite3")
             self.store.transition("start")
@@ -2128,7 +2363,7 @@ def self_test(directory=None):
             roster=[{"username":"FifthSparkGMZ","aliases":["Fifth Spark"]},{"username":"ActualUser","aliases":["Meow Skulls"]}]
             settings=self.settings | {"patterns":[FISCH_PATTERN],"registered_players":roster,"best_effort":True}
             for label in ("F FifthSparkG MZ Z","FifthSparkGMZ","FifthSparkGM","Fifth Spark"):
-                parsed=parse_catch(f"[System] {label} has perfectly caught a Common ( 0.6kg Sparkling Giant Plagued Anchovy!",.86,1,settings)
+                parsed=parse_catch(f"[System] {label} has perfectly caught a Common ( 0.6kg Sparkling Giant Plagued Anchovy!",.96,1,settings)
                 self.assertEqual((parsed["status"],parsed["username"]),("confirmed","FifthSparkGMZ"))
             parsed=parse_catch("[System] N Meow Skulls I has caught a Common : 2.6kg Snapper!",1,1,settings)
             self.assertEqual((parsed["status"],parsed["username"]),("confirmed","ActualUser"))
@@ -2331,9 +2566,13 @@ def self_test(directory=None):
             self.assertEqual(self.store.active()["elapsed_seconds"],0)
             self.assertIsNone(self.store.active()["scheduled_start"])
 
-        def test_best_effort_scores_uncertain_readable_catches(self):
+        def test_best_effort_preserves_confidence_guards_and_visual_identity(self):
             settings=self.settings | {"best_effort":True,"parser_verified":False}
             fields=parse_catch("PlayerA caught Rare Carp (10.5 kg)",.4,.35,settings)
+            self.assertEqual(fields["status"],"review")
+            for ocr,visual in ((.4,1),(1,.35),(float('nan'),1),(1,float('nan'))):
+                self.assertEqual(parse_catch("PlayerA caught Rare Carp (10.5 kg)",ocr,visual,settings)["status"],"review")
+            fields=parse_catch("PlayerA caught Rare Carp (10.5 kg)",1,1,settings)
             self.assertEqual(fields["status"],"confirmed")
             self.assertEqual(parse_catch("unreadable",.4,.35,settings)["status"],"review")
             self.assertEqual(parse_catch("PlayerA caught Rare Carp (bad kg)",.4,.35,settings)["status"],"review")
@@ -2341,9 +2580,10 @@ def self_test(directory=None):
             first=self.store.insert(fields,"fast:1",tid,"2026-10-13T13:00:00+00:00")
             self.assertIsNotNone(first)
             variant=fields | {"fish":"Carp!"}
+            self.assertIsNotNone(self.store.insert(variant,"fast:2",tid,"2026-10-13T13:00:01+00:00"))
             self.assertIsNone(self.store.insert(variant,"fast:2",tid,"2026-10-13T13:00:01+00:00"))
             self.assertIsNotNone(self.store.insert(fields,"fast:3",tid,"2026-10-13T13:00:04+00:00"))
-            self.assertEqual(self.store.state()["leaderboard"][0]["total_kg"],21)
+            self.assertEqual(self.store.state()["leaderboard"][0]["total_kg"],31.5)
 
         def test_single_new_event_exactly_once(self):
             tracker=VisualTracker()
@@ -2553,6 +2793,123 @@ def self_test(directory=None):
             candidates=self.feed(tracker,["Totally different screen", "PlayerA caught Rare Carp (10 kg)"])
             self.assertLess(candidates[0][1],.9)
 
+        def test_default_pipeline_redraw_cannot_rescore_visible_history(self):
+            self.config.update({"patterns":[FISCH_PATTERN],"message_start":FISCH_START,"best_effort":True})
+            text="[System] PlayerA has caught a Common 5.1kg Big Lumpy Trout!"
+            session=self.store.active()["id"]
+            fields=parse_catch(text,.99,1,self.config.snapshot())
+            self.store.insert(fields,"original",session,"2026-10-28T12:00:00+00:00")
+            r=self.runtime
+            r.engine=lambda image: ([([[0,0],[500,0],[500,20],[0,20]],text,.99)],None)
+            r.candidates=queue.Queue(4)
+            r.candidates.put((synthetic_frame([text]),.35,"redraw",session,"2026-10-28T12:00:10+00:00"))
+            r.track_done.set();r.ocr_loop()
+            self.assertEqual(self.store.state()["counts"],{"confirmed":1,"review":1})
+            self.assertEqual(self.store.state()["leaderboard"][0]["catches"],1)
+            review=next(e for e in self.store.events()["items"] if e["status"]=="review")
+            self.assertEqual(review["reason"],"Uncertain visual insertion")
+            self.assertTrue((self.config.directory/'evidence'/review['evidence']).is_file())
+
+        def test_colored_tracking_keeps_gray_and_purple_wrapped_rows(self):
+            for color in ((150,150,150),(200,100,160),(200,190,150),(80,240,120)):
+                with self.subTest(color=color):
+                    def frame(rows):
+                        image=synthetic_frame(rows)
+                        image[np.any(image>0,axis=2)]=color
+                        return image
+                    tracker=VisualTracker()
+                    old=frame(["OldA","OldB"])
+                    tracker.feed(old);tracker.feed(old)
+                    new=frame(["OldA","OldB","[System] PlayerA has caught","a Common 5.1kg Big Lumpy Trout!"])
+                    tracker.feed(new)
+                    candidates,_=tracker.feed(new)
+                    self.assertEqual(len(candidates),1)
+                    self.assertEqual(len(row_bands(glyph_mask(candidates[0][0]))),2)
+                    self.assertGreaterEqual(candidates[0][1],.9)
+
+        def test_contrast_retry_recovers_weak_read_and_keeps_strong_read(self):
+            settings=self.settings | {"patterns":[FISCH_PATTERN],"message_start":FISCH_START}
+            text="[System] PlayerA has caught a Common 5.1kg Big Lumpy Trout!"
+            box=[[0,0],[500,0],[500,20],[0,20]]
+            calls=[]
+            def engine(image):
+                calls.append(image)
+                return [(box,text,.6 if len(calls)==1 else .99)],None
+            groups=recognize_chat(engine,synthetic_frame([text]),settings)
+            self.assertEqual(len(calls),2)
+            self.assertEqual(groups,[[text,.99]])
+            self.assertEqual(tuple(calls[1][0,0]),(255,255,255))
+            calls.clear()
+            def strong(image):
+                calls.append(image)
+                return [(box,text,.99)],None
+            self.assertEqual(recognize_chat(strong,synthetic_frame([text]),settings),[[text,.99]])
+            self.assertEqual(len(calls),1)
+
+        def test_contrast_retry_disagreement_never_scores(self):
+            settings=self.settings | {"patterns":[FISCH_PATTERN],"message_start":FISCH_START,"best_effort":True}
+            template="[System] PlayerA has caught a Common {}kg Trout!"
+            outputs=iter([([( [[0,0],[500,0],[500,20],[0,20]],template.format(weight),score)],None)
+                          for weight,score in (("5.1",.6),("51.1",.99))])
+            groups=recognize_chat(lambda image:next(outputs),synthetic_frame(["text"]),settings)
+            self.assertEqual(groups,[[template.format("5.1"),0.0]])
+            self.assertEqual(parse_catch(groups[0][0],groups[0][1],1,settings)["status"],"review")
+
+        def test_confident_stray_fish_letter_is_verified_without_guessing(self):
+            settings=self.settings | {"patterns":[FISCH_PATTERN],"message_start":FISCH_START,"best_effort":True}
+            texts=["[System] PlayerA has caught a Common 5.1kg Big S Sovereign Bass!",
+                   "[System] PlayerA has caught a Common 5.1kg Big Sovereign Bass!"]
+            outputs=iter([([([[0,0],[500,0],[500,20],[0,20]],text,.99)],None) for text in texts])
+            groups=recognize_chat(lambda image:next(outputs),synthetic_frame(["text"]),settings)
+            self.assertEqual(groups,[[texts[0],0.0]])
+
+        def test_default_pipeline_counts_equal_weight_distinct_messages(self):
+            self.config.update({"patterns":[FISCH_PATTERN],"message_start":FISCH_START,"best_effort":True})
+            texts=["[System] PlayerA has caught a Common 5.1kg Trout!",
+                   "[System] PlayerA has caught a Common 5.1kg Bass!",
+                   "[System] PlayerA has caught a Common 5.1kg Bass!"]
+            outputs=iter([([([[0,0],[500,0],[500,20],[0,20]],text,.99)],None) for text in texts])
+            r=self.runtime;r.engine=lambda image:next(outputs);r.candidates=queue.Queue(4)
+            for index in range(3):
+                r.candidates.put((synthetic_frame([texts[index]]),1,f"distinct:{index}",self.store.active()["id"],now()))
+            r.track_done.set();r.ocr_loop()
+            self.assertEqual(self.store.state()["leaderboard"][0]["catches"],3)
+            self.assertEqual(self.store.state()["leaderboard"][0]["total_kg"],15.3)
+
+        def test_large_font_wraps_join_across_three_insertions(self):
+            self.config.update({"patterns":[FISCH_PATTERN],"message_start":FISCH_START,"best_effort":True})
+            parts=["[System] FifthSparkGMZ has", "perfectly caught a Common 5.1kg", "Big Sovereign Largemouth Bass!"]
+            outputs=iter([([([[0,0],[500,0],[500,20],[0,20]],text,.99)],None) for text in
+                          (parts[0],parts[0],parts[1],parts[1],parts[2],parts[2])])
+            r=self.runtime;r.engine=lambda image:next(outputs);r.candidates=queue.Queue(4)
+            for index,text in enumerate(parts):
+                r.candidates.put((synthetic_frame([text]),1,f"wrap:{index}",self.store.active()["id"],now()))
+            r.track_done.set();r.ocr_loop()
+            events=self.store.events()["items"]
+            self.assertEqual(len(events),1)
+            self.assertEqual((events[0]["status"],events[0]["fish"],events[0]["weight_units"]),
+                             ("confirmed","Big Sovereign Largemouth Bass",5100000))
+            self.assertEqual(events[0]["visual_id"],"wrap:0:0")
+
+        def test_expired_wrap_is_not_joined_when_queue_stays_busy(self):
+            from unittest.mock import patch
+            self.config.update({"patterns":[FISCH_PATTERN],"message_start":FISCH_START,"best_effort":True})
+            prefix="[System] FifthSparkGMZ has caught a Common 5.1kg"
+            parts=iter([prefix,prefix,"Big Lumpy Trout!","Big Lumpy Trout!"])
+            clock=[0.0]
+            def engine(image):
+                text=next(parts)
+                if text.startswith("Big"):
+                    clock[0]=2.0
+                return [([[0,0],[500,0],[500,20],[0,20]],text,.99)],None
+            r=self.runtime;r.engine=engine;r.candidates=queue.Queue(4)
+            for index in range(2):
+                r.candidates.put((synthetic_frame(["text"]),1,f"expired:{index}",self.store.active()["id"],now()))
+            r.track_done.set()
+            with patch("time.monotonic",lambda:clock[0]):
+                r.ocr_loop()
+            self.assertEqual(self.store.state()["counts"],{"review":2})
+
         def test_reconnect_full_snapshot_and_disconnect_isolation(self):
             # Exercise the actual SSE iterator with a fake request rather than
             # TestClient's buffering of an infinite response.
@@ -2591,10 +2948,22 @@ def smoke_test(directory):
         config=Config(tmp)
         runtime=Runtime(config,Store(Path(tmp)/"smoke.sqlite3"))
         runtime.initialize_ocr()
-        results,_=runtime.engine(cv2.resize(synthetic_frame(["PlayerA caught Rare Carp (10.5 kg)"]),None,fx=2,fy=2))
-        recognized=" ".join(r[1] for r in results or [])
+        results=runtime.read_rows(synthetic_frame(["PlayerA caught Rare Carp (10.5 kg)"]),config.snapshot())
+        recognized=" ".join(r[0] for r in results)
         if "PlayerA" not in recognized or "Carp" not in recognized:
             raise RuntimeError(f"Bundled OCR smoke recognition failed: {recognized}")
+        # Exercise the actual default capture/history/parser/persistence path,
+        # including two distinct identical announcements after an excluded baseline.
+        probe=Runtime(config,Store(Path(tmp)/"live-ocr.sqlite3"))
+        probe.auto_monitor=False;probe.engine=runtime.engine;probe.run_id="smoke-tesseract"
+        probe.store.transition("start")
+        probe.frames=queue.Queue(8);probe.candidates=queue.Queue(8)
+        announcement="[System] PlayerA has caught a Common 5.1kg Trout!"
+        for rows in (["Old history"],["Old history",announcement],["Old history",announcement,announcement]):
+            probe.frames.put((synthetic_frame(rows),probe.store.active()["id"],"running",now(),0,0))
+        probe.monitor_stop.set();probe.track_loop();probe.ocr_loop()
+        if probe.store.state()["counts"] != {"confirmed":2}:
+            raise RuntimeError(f"Tesseract live pipeline smoke failed: {probe.store.events()}")
         with socket.socket() as sock:
             sock.bind(("127.0.0.1",0));port=sock.getsockname()[1]
         thread=launch_server(runtime,"127.0.0.1",port)
@@ -2613,6 +2982,11 @@ def smoke_test(directory):
             assert json.load(urllib.request.urlopen(req,timeout=5))["ok"]
             req=urllib.request.Request(base+"/api/config")
             assert "admin_token" not in json.load(urllib.request.urlopen(req,timeout=5))
+            reader_settings={"ocr_backend":"tesseract","capture_interval":2.0,"tesseract_mode":"Contrast",
+                             "tesseract_scale":2,"tesseract_psm":6,"tesseract_path":""}
+            req=urllib.request.Request(base+"/api/config",data=json.dumps(reader_settings).encode(),
+                                       headers={"Content-Type":"application/json"},method="PATCH")
+            assert json.load(urllib.request.urlopen(req,timeout=5))["ok"]
             req=urllib.request.Request(base+"/api/events",data=json.dumps({"username":"PlayerA","fish":"Carp","rarity":"Rare","weight_kg":"10.5"}).encode(),headers={"Content-Type":"application/json"},method="POST")
             event_id=json.load(urllib.request.urlopen(req,timeout=5))["id"]
             assert event_id==1
@@ -2642,7 +3016,7 @@ def smoke_test(directory):
             launch_gui(runtime,"127.0.0.1",port,smoke=True)
         finally:
             runtime.close();thread.join(timeout=10)
-        report="PASS: packaged models load offline; synthetic OCR recognizes player/fish; HTTP routes; password-free mutation and cross-origin protection; full SSE snapshot; name corrections and automatic joining, rules and password-free kick; Qt window launches and closes.\nOCR: "+recognized+"\nClean Windows without Python and real two-player Fisch: NOT VERIFIED.\n"
+        report="PASS: Tesseract recognizes player/fish offline; full-chat history excludes baseline and scores distinct identical catches; reader settings and HTTP routes; password-free mutation and cross-origin protection; full SSE snapshot; name corrections and automatic joining, rules and password-free kick; Qt window launches and closes.\nOCR: "+recognized+"\nClean Windows without Python and real two-player Fisch: NOT VERIFIED.\n"
         Path(directory,"smoke-results.txt").write_text(report,encoding="utf-8")
         if sys.stdout:
             print(report)
@@ -2650,11 +3024,17 @@ def smoke_test(directory):
 
 def build():
     import subprocess
+    from tesseract_chat_reader import tesseract_bundle_files
     command=[sys.executable,"-m","PyInstaller","--noconfirm","--clean","--onedir","--windowed",
              "--name","SpaceGoatFisch","--collect-all","rapidocr_onnxruntime","--collect-all","onnxruntime",
              "--hidden-import","uvicorn.logging","--hidden-import","uvicorn.loops.auto",
              "--hidden-import","uvicorn.protocols.http.h11_impl","--hidden-import","uvicorn.lifespan.on",
              str(Path(__file__).resolve())]
+    binaries,data = tesseract_bundle_files()
+    for source,destination in binaries:
+        command[-1:-1] = ["--add-binary",source+os.pathsep+destination]
+    for source,destination in data:
+        command[-1:-1] = ["--add-data",source+os.pathsep+destination]
     subprocess.run(command,check=True)
 
 

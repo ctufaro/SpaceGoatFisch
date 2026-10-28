@@ -10,6 +10,8 @@ if (-not (Test-Path -LiteralPath '.spacegoat-build\Scripts\python.exe')) {
 $buildPython = Join-Path $PSScriptRoot '.spacegoat-build\Scripts\python.exe'
 & $buildPython -m pip install -r spacegoat-requirements.lock
 if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+& $buildPython -m unittest test_tesseract_chat_reader test_live_tesseract
+if ($LASTEXITCODE -ne 0) { throw 'Tesseract integration tests failed.' }
 & $buildPython spacegoat_fisch_server.py --self-test --data-dir spacegoat-validation
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
 & $buildPython spacegoat_fisch_server.py --build --data-dir spacegoat-validation
@@ -55,7 +57,7 @@ $manifest = [ordered]@{
     source_sha256 = (Get-FileHash -LiteralPath 'spacegoat_fisch_server.py' -Algorithm SHA256).Hash
     executable_sha256 = (Get-FileHash -LiteralPath (Join-Path $bundle 'SpaceGoatFisch.exe') -Algorithm SHA256).Hash
     dependencies_sha256 = (Get-FileHash -LiteralPath 'spacegoat-requirements.lock' -Algorithm SHA256).Hash
-    validation = '36 scoring/parser/lifecycle/cancellation/corrections/kick/rules/overlay tests, packaged OCR/HTTP/SSE/Qt smoke test, and launch with Python removed from PATH passed on build machine'
+    validation = 'Tesseract history/live integration and scoring/parser/lifecycle tests, packaged Tesseract/HTTP/SSE/Qt smoke test, and launch with Python removed from PATH passed on build machine'
     built_utc = [DateTime]::UtcNow.ToString('o')
     outstanding = @('Clean Windows without Python', 'Real two-player Fisch observer visibility', 'Actual OBS and mixed-DPI target hardware')
 }
