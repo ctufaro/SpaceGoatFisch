@@ -7,6 +7,7 @@ No gameplay APIs are used. A visual observer cannot recover unseen messages.
 from __future__ import annotations
 
 import argparse
+from collections import Counter, OrderedDict
 import asyncio
 import csv
 import hashlib
@@ -283,10 +284,12 @@ def parse_catch(raw, confidence, visual_confidence, settings):
                 result["weight_units"] = parse_weight(weight[1], settings)
         if not np.isfinite(confidence) or confidence < settings["confidence"]:
             result["reason"] = "Low OCR confidence"
-        elif not np.isfinite(visual_confidence) or visual_confidence < 0.9:
+        elif not np.isfinite(visual_confidence) or (visual_confidence < 0.9 and not (
+                settings.get("best_effort", False) and settings.get("allow_unanchored", False))):
             result["reason"] = "Uncertain visual insertion"
         elif settings.get("best_effort", False):
-            result.update(status="confirmed", reason="Best-effort live score")
+            result.update(status="confirmed", reason=("Best-effort score; no text overlap" if visual_confidence < .9
+                                                     else "Best-effort live score"))
         elif not settings["parser_verified"]:
             result["reason"] = "Parser not verified against real Fisch samples"
         else:
@@ -763,6 +766,52 @@ class TesseractLiveEngine:
         return [(line,max(0.0,min(1.0,score/100))) for line,score in zip(reading.lines,scores)]
 
 
+class RecentCatchReads:
+    """Prevent gap reads from replaying complete catches recently on screen.
+
+    Exact text overlap still establishes distinct equal arrivals. Only fallback
+    reads use this bounded occurrence cache; numeric weights are never fuzzed.
+    """
+    def __init__(self, ttl=30.0, capacity=512):
+        self.ttl, self.capacity = ttl, capacity
+        self.entries = OrderedDict()
+
+    @staticmethod
+    def key(text, settings):
+        fields = parse_catch(text,1,1,settings)
+        if not fields["username"] or not fields["fish"]:
+            return None
+        fish = re.sub(r"\s+", "", unicodedata.normalize("NFKC",fields["fish"])).casefold()
+        return fields["username"].casefold(),fields["rarity"].casefold(),fields["weight_units"],fish
+
+    def counts(self, groups, settings):
+        return Counter(key for text,_ in groups if (key := self.key(text,settings)) is not None)
+
+    def unseen(self, groups, settings):
+        current = Counter()
+        fresh = []
+        clock = time.monotonic()
+        for text,score in groups:
+            key = self.key(text,settings)
+            if key is None:
+                fresh.append((text,score))
+                continue
+            current[key] += 1
+            count,seen = self.entries.get(key,(0,0))
+            if clock-seen > self.ttl or current[key] > count:
+                fresh.append((text,score))
+        return fresh
+
+    def remember(self, counts):
+        clock = time.monotonic()
+        for key,count in counts.items():
+            previous,seen = self.entries.get(key,(0,0))
+            self.entries[key] = (max(previous,count) if clock-seen <= self.ttl else count,clock)
+            self.entries.move_to_end(key)
+        while len(self.entries) > self.capacity:
+            self.entries.popitem(last=False)
+
+
 class Runtime:
     def __init__(self, config, store):
         self.config, self.store = config, store
@@ -1081,6 +1130,7 @@ class Runtime:
             self.monitor_stop.set()
             return
         history = RollingChatHistory()
+        recent = RecentCatchReads(ttl=max(30.0,3*self.config.snapshot()["capture_interval"]))
         context = None
         previous_pixels = None
         baselined = False
@@ -1104,6 +1154,7 @@ class Runtime:
                         self.persist_ocr(pending)
                     pending = None
                     history.clear()
+                    recent.entries.clear()
                     previous_pixels = None
                     baselined = False
                     context = epoch
@@ -1121,25 +1172,31 @@ class Runtime:
                     continue
                 previous_pixels = fingerprint
                 delta = history.update([text for text,_ in rows])
+                visible_counts = recent.counts(group_chat_rows(rows,settings),settings)
                 self.update_health(chat_history=delta.status)
                 if not baselined:
                     baselined = True
+                    recent.remember(visible_counts)
                     self.update_health(chat_history="Baseline established; visible messages excluded")
                     continue
                 if status != "running" or not delta.lines:
+                    recent.remember(visible_counts)
                     continue
                 visual = 1.0 if delta.overlap else .35
                 if visual < .9:
-                    self.warn("No reliable chat text overlap; visible catches held for review")
+                    self.update_health(chat_history="No text overlap; checking recent catches before best-effort scoring")
                     if pending:
                         self.persist_ocr(pending)
                     pending = None
                 evidence = self.save_evidence(image, identity, force=visual < .9)
                 groups = group_chat_rows(rows[-len(delta.lines):], settings)
+                if visual < .9:
+                    groups = recent.unseen(groups,settings)
+                recent.remember(visible_counts)
                 for index,(text,score) in enumerate(groups):
                     piece = {"text":text,"confidence":score,"visual":visual,"identity":f"{identity}:{index}",
                              "session":session,"stamp":stamp,"evidence":evidence,"since":time.monotonic(),
-                             "epoch":epoch[-1]}
+                             "epoch":epoch[-1],"allow_unanchored":visual < .9}
                     if pending:
                         if (time.monotonic()-pending["since"] <= wrap_timeout
                                 and not re.search(settings["message_start"],text,re.IGNORECASE)):
@@ -1148,10 +1205,12 @@ class Runtime:
                                          visual=min(visual,pending["visual"]),identity=pending["identity"],
                                          stamp=pending["stamp"],since=pending["since"],
                                          evidence=pending["evidence"] or evidence)
+                            piece["allow_unanchored"] |= pending.get("allow_unanchored",False)
                         else:
                             self.persist_ocr(pending)
                         pending = None
-                    parsed = parse_catch(piece["text"],piece["confidence"],piece["visual"],settings)
+                    parsed = parse_catch(piece["text"],piece["confidence"],piece["visual"],
+                                         settings | {"allow_unanchored":piece["allow_unanchored"]})
                     if parsed["status"] == "review" and not piece["evidence"]:
                         piece["evidence"] = self.save_evidence(image,identity,force=True)
                     if parsed["status"] == "confirmed" or parsed["weight_units"] > 0 or index < len(groups)-1:
@@ -1300,6 +1359,7 @@ class Runtime:
             if piece.get("epoch", self.session_epoch) != self.session_epoch:
                 return
             settings = self.config.snapshot() | {"scoring_mode": self.store.active()["scoring_mode"]}
+            settings["allow_unanchored"] = piece.get("allow_unanchored",False)
             fields = parse_catch(piece["text"], piece["confidence"], piece["visual"], settings)
             self.store.insert(fields, piece["identity"], piece["session"], piece["stamp"], piece.get("evidence"))
             self.changed()

@@ -74,13 +74,59 @@ class LiveTesseractTests(unittest.TestCase):
         self.assertEqual(self.store.state()["leaderboard"][0]["catches"],3)
         self.assertEqual(self.store.state()["leaderboard"][0]["total_kg"],15.3)
 
-    def test_nonoverlapping_view_cannot_rescore_history(self):
+    def test_nonoverlapping_new_catch_counts_in_best_effort_mode(self):
         self.run_views([[OLD],[FIRST],[OLD],[OLD,FIRST]])
-        # The disconnected FIRST is review-only; OLD is a known historical view.
-        self.assertEqual(self.store.state()["counts"],{"review":1,"confirmed":1})
-        review=next(e for e in self.store.events()["items"] if e["status"]=="review")
-        self.assertEqual(review["reason"],"Uncertain visual insertion")
-        self.assertTrue((Path(self.folder.name)/"evidence"/review["evidence"]).exists())
+        # FIRST scores despite a gap. A later anchored equal arrival is separate.
+        self.assertEqual(self.store.state()["counts"],{"confirmed":2})
+        fallback=next(e for e in self.store.events()["items"] if e["visual_confidence"]<.9)
+        self.assertEqual(fallback["reason"],"Best-effort score; no text overlap")
+        self.assertTrue((Path(self.folder.name)/"evidence"/fallback["evidence"]).exists())
+
+    def test_strict_mode_still_reviews_nonoverlapping_catch(self):
+        self.config.update({"best_effort":False})
+        self.run_views([[OLD],[FIRST]])
+        self.assertEqual(self.store.state()["counts"],{"review":1})
+
+    def test_gap_reread_does_not_count_old_catches_with_changed_wrapping(self):
+        self.run_views([[OLD],[OLD,FIRST],
+                        ["[System] OldPlayer has caught a Common 1.0kg","Old Trout!",
+                         "[System] PlayerA has caught a Common 5.1kg","Big Lumpy Trout!",SECOND]])
+        self.assertEqual(self.store.state()["counts"],{"confirmed":2})
+        self.assertEqual({e["username"] for e in self.store.events()["items"]},{"PlayerA","PlayerB"})
+
+    def test_gap_fallback_still_requires_ocr_confidence(self):
+        self.run_views([[OLD],[FIRST]],scores=[.99,.4])
+        self.assertEqual(self.store.events()["items"][0]["reason"],"Low OCR confidence")
+
+    def test_gap_preserves_additional_identical_occurrences(self):
+        prefix="[System] PlayerA has caught a Common 5.1kg"
+        tail="Big Lumpy Trout!"
+        self.run_views([[OLD],[OLD,FIRST],[prefix,tail,prefix,tail]])
+        self.assertEqual(self.store.state()["leaderboard"][0]["catches"],2)
+
+    def test_recent_gap_cache_is_bounded_and_expires_after_leaving_view(self):
+        from unittest.mock import patch
+        cache=live.RecentCatchReads(ttl=30,capacity=1)
+        settings=self.config.snapshot()
+        groups=[(FIRST,.99)]
+        with patch.object(live.time,"monotonic",return_value=100):
+            cache.remember(cache.counts(groups,settings))
+            self.assertEqual(cache.unseen(groups,settings),[])
+        with patch.object(live.time,"monotonic",return_value=131):
+            self.assertEqual(cache.unseen(groups,settings),groups)
+            cache.remember(cache.counts([(SECOND,.99)],settings))
+        self.assertEqual(len(cache.entries),1)
+
+    def test_exact_screenshot_trash_message_counts_without_line_overlap(self):
+        self.config.update({"patterns":[r"^\[\s*System\s*\]\s*(?P<username>[A-Za-z0-9_]{3,20})\s+has\s+(?:perfectly\s+)?caught\s+an?\s+(?P<rarity>Trash)\s+(?P<weight>\d+(?:[.,]\d+)?)\s*kg\s+(?P<fish>.+?)\s*[!.]+$"]})
+        self.run_views([["Previous chat"],
+                        ["Caught an Unusual 5.7kg Big Rockstar","Pike!",
+                         "[System] FifthSparkGMZ has caught an","Uncommon 0.8kg Big Bubblegum","Goldfish!",
+                         "[system] FifthSparkGMZ has perfectly","caught a Trash 22.5kg Giant Sovereign","Tire!"]])
+        confirmed=[e for e in self.store.events()["items"] if e["status"]=="confirmed"]
+        self.assertEqual(len(confirmed),1)
+        self.assertEqual((confirmed[0]["username"],confirmed[0]["fish"],confirmed[0]["weight_units"]),
+                         ("FifthSparkGMZ","Giant Sovereign Tire",22500000))
 
     def test_wrapped_message_joins_new_rows_across_captures(self):
         header="Existing chat"

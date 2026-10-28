@@ -6,7 +6,7 @@ Windows x64 tournament server with OCR, an admin dashboard, and an OBS leaderboa
 
 The live app now defaults to the standalone tool's **Tesseract + rolling history** reader: full-region screenshots, color-independent contrast, scale 2, PSM 6, and a 2-second interval. Set the interval, preprocessing, scale, PSM, executable path, or legacy RapidOCR reader under **Capture / OCR > Reader settings** while capture is stopped. The desktop window also exposes the capture interval for the next start. Use the same settings that worked in the standalone tool.
 
-The first readable view after starting capture or a tournament transition establishes a baseline and excludes messages already visible. Bottom-up ordered overlap and 128 viewport hashes identify subsequent new rows, which feed the existing wrapped-message parser and scoring rules. Separate identical announcements remain separate catches. No-overlap views go to review with screenshots instead of automatically rescoring old chat. In-flight reads from an earlier tournament state are discarded.
+The first readable view after starting capture or a tournament transition establishes a baseline and excludes messages already visible. Bottom-up ordered overlap and 128 viewport hashes identify subsequent new rows, which feed the existing wrapped-message parser and scoring rules. Separate identical announcements remain separate catches. In best-effort mode, complete high-confidence catches also score without exact line overlap. A bounded recent-catch occurrence cache excludes already-visible announcements across changed wrapping; strict mode keeps no-overlap catches in review. Screenshots retain the fallback evidence. In-flight reads from an earlier tournament state are discarded.
 
 The default minimum OCR confidence is 85% for Tesseract. Older configurations using the shipped 92% RapidOCR threshold migrate to 85%, with a `config.pre-tesseract.json` backup; custom thresholds and explicit backend choices are preserved. Confidence is calculated per physical row, so a strong neighboring message cannot hide a weak read. The minimum remains editable under Parser calibration.
 
@@ -50,7 +50,7 @@ Under **Player name corrections**, choose the encountered name to merge and its 
 
 Manual catch editing, overlay settings, and parser calibration are collapsed until needed. Pattern selection stays visible.
 
-The default Tesseract reader preserves gray and colored text using the standalone tool's contrast preprocessing. The optional legacy RapidOCR reader retains its contrast retry for weak or suspicious reads. Best-effort parsing still requires the configured minimum OCR confidence and reliable insertion evidence; uncertain redraws cannot automatically score visible history. Separate insertions remain separate catches even when their names and weights match.
+The default Tesseract reader preserves gray and colored text using the standalone tool's contrast preprocessing. The optional legacy RapidOCR reader retains its contrast retry for weak or suspicious reads. Best-effort parsing requires the configured minimum OCR confidence. Tesseract uses recent complete-catch occurrences to suppress replayed messages when exact line overlap is unavailable; strict mode also requires reliable insertion evidence. Separate insertions remain separate catches even when their names and weights match.
 
 Use a stable dark chat background and keep complete messages inside the selected region. Larger text helps recognition but leaves fewer messages visible. Unseen or clipped announcements cannot be reliably recovered; use **Test OCR / Preview** after changing the font or capture region and review uncertain events in the catch feed.
 
@@ -63,3 +63,5 @@ Use a stable dark chat background and keep complete messages inside the selected
 Validation writes to `.verification`, separate from tournament data. Live game capture, OBS, and display settings require checks on the target laptop.
 
 See `SpaceGoat-Setup.md` for application controls, OBS, and packaging. Build a standalone executable with `powershell -NoProfile -ExecutionPolicy Bypass -File .\spacegoat-build.ps1`. Generated environments, builds, validation reports, and private tournament data are excluded from Git.
+
+For a complete readable catch held as **Uncertain visual insertion**, enable **Best-effort live scoring** under Parser calibration and save. New qualifying Tesseract catches can score even with a 35% visual diagnostic. Existing review records are not automatically reprocessed: use **Review / edit**, choose **Confirmed**, and **Save**. The recent fallback cache is limited to 512 catch keys and expires keys after at least 30 seconds off screen; identical arrivals without observable overlap can remain ambiguous.
